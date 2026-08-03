@@ -1,0 +1,16 @@
+# 虛擬環境與 Python 快取
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Streamlit 暫存與設定
+.streamlit/
+
+# 本地下載的全市場數據檔 (避免檔案太龐大上傳失敗)
+*.parquet
+*.pickle
+*.csv
+
+# 個人隱私設定或 API 金鑰
+.env
