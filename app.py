@@ -190,83 +190,93 @@ def render_kline_chart(stock_id, short_ma, long_ma, signal_type):
 
     # 2. 準備圖表資料與單位換算
     df_chart = df_selected.tail(90).reset_index()
-    # 新程式碼（正確：全面無條件捨去成張數）
     df_chart['Volume_Sheets'] = df_chart['Volume'] // 1000
-    
-    # 計算前一天收盤價做為 K棒 Hover 比對紅綠之基準
     df_chart['Prev_Close'] = df_chart['Close'].shift(1).fillna(df_chart['Open'])
     
+    # 📌 關鍵修正 1：直接使用日期字串作為 X 軸，這樣游標對齊時跳出來的就會是「2026-08-04」而不是「87」！
     date_strings = df_chart['Date'].dt.strftime('%Y-%m-%d').tolist()
-    x_indices = list(range(len(df_chart)))
+    x_vals = date_strings 
 
-    # 動態產生 K棒與成交量的 HTML 提示文字
-    kline_hover_texts = []
     vol_hover_texts = []
+    combined_texts = [] 
     
+    # 📌 關鍵修正 2：把 K 棒顏色與替身文字的迴圈「合併」，找回失去的紅綠色！
     for idx, row in df_chart.iterrows():
-        # 處理成交量 Hover
+        # 成交量
         vol_hover_texts.append(f"<b>{date_strings[idx]}</b><br>成交量: {row['Volume_Sheets']:,} 張")
         
-        # 處理 K 棒 Hover (帶紅綠色與箭頭)
+        # K 棒顏色判斷
         prev_c = row['Prev_Close']
-        
         def get_color_str(val, base):
-            if val > base:
-                return f"<span style='color:#ef5350;'>{val:.2f} ▲</span>"
-            elif val < base:
-                return f"<span style='color:#26a69a;'>{val:.2f} ▼</span>"
-            else:
-                return f"<span style='color:#ffffff;'>{val:.2f}</span>"
+            if val > base: return f"<span style='color:#ef5350;'>{val:.2f} ▲</span>"
+            elif val < base: return f"<span style='color:#26a69a;'>{val:.2f} ▼</span>"
+            else: return f"<span style='color:#ffffff;'>{val:.2f}</span>"
 
         open_html = get_color_str(row['Open'], prev_c)
         high_html = get_color_str(row['High'], prev_c)
         low_html = get_color_str(row['Low'], prev_c)
         close_html = get_color_str(row['Close'], prev_c)
 
+        # 組裝成一個包含所有資訊、且帶有顏色的完美對話框
         text = (
-            f"<b>{date_strings[idx]}</b><br>"
+            f"<b>{date_strings[idx]}</b><br><br>"
             f"{t['chart_open']}: {open_html}<br>"
             f"{t['chart_high']}: {high_html}<br>"
             f"{t['chart_low']}: {low_html}<br>"
-            f"{t['chart_close']}: {close_html}"
+            f"{t['chart_close']}: {close_html}<br><br>"
+            f"<span style='color:#ffa726;'>{short_ma}MA: {row['MA_short']:.2f}</span><br>"
+            f"<span style='color:#42a5f5;'>{long_ma}MA: {row['MA_long']:.2f}</span>"
         )
-        kline_hover_texts.append(text)
+        combined_texts.append(text)
 
     # 3. 繪製圖表
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
 
-    # K 線圖 (補回 custom hovertext)
-    fig.add_trace(go.Candlestick(
-        x=x_indices, open=df_chart['Open'], high=df_chart['High'], 
-        low=df_chart['Low'], close=df_chart['Close'], name=t['chart_kline'], 
-        increasing_line_color='#ef5350', decreasing_line_color='#26a69a',
-        hoverinfo="text",
-        hovertext=kline_hover_texts
+    # (1) 隱形追蹤器 (綁定帶有顏色的 combined_texts)
+    fig.add_trace(go.Scatter(
+        x=x_vals, y=df_chart['Close'], mode='lines', line=dict(color='rgba(0,0,0,0)'), 
+        text=combined_texts, hovertemplate="%{text}<extra></extra>", showlegend=False, hoverinfo="text"
     ), row=1, col=1)
 
-    # 均線
-    fig.add_trace(go.Scatter(x=x_indices, y=df_chart['MA_short'], mode='lines', name=f'{short_ma}MA', line=dict(color='#ff9800', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=x_indices, y=df_chart['MA_long'], mode='lines', name=f'{long_ma}MA', line=dict(color='#2196f3', width=2)), row=1, col=1)
+    # (2) K 線圖 (hoverinfo='skip')
+    fig.add_trace(go.Candlestick(
+        x=x_vals, open=df_chart['Open'], high=df_chart['High'], low=df_chart['Low'], close=df_chart['Close'], 
+        name=t['chart_kline'], increasing_line_color='#ef5350', decreasing_line_color='#26a69a', hoverinfo='skip'
+    ), row=1, col=1)
+
+    # (3) 短均線 (hoverinfo='skip')
+    fig.add_trace(go.Scatter(
+        x=x_vals, y=df_chart['MA_short'], name=f"{short_ma}MA", line=dict(color='orange', width=1.5), hoverinfo='skip'
+    ), row=1, col=1)
+
+    # (4) 長均線 (hoverinfo='skip')
+    fig.add_trace(go.Scatter(
+        x=x_vals, y=df_chart['MA_long'], name=f"{long_ma}MA", line=dict(color='#42a5f5', width=1.5), hoverinfo='skip'
+    ), row=1, col=1)
     
-    # 成交量柱狀圖
+    # (5) 成交量柱狀圖
     price_diff = df_chart['Close'].diff().fillna(0)
     vol_colors = ['#ef5350' if diff >= 0 else '#26a69a' for diff in price_diff]
-    
     fig.add_trace(go.Bar(
-        x=x_indices, 
-        y=df_chart['Volume_Sheets'], 
-        name=t['chart_vol'], 
-        marker_color=vol_colors, 
-        opacity=0.7,
-        hoverinfo="text",
-        hovertext=vol_hover_texts
+        x=x_vals, y=df_chart['Volume_Sheets'], name=t['chart_vol'], 
+        marker_color=vol_colors, opacity=0.7, hoverinfo="text", hovertext=vol_hover_texts
     ), row=2, col=1)
 
-    fig.update_layout(height=500, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False)
-    step = max(1, len(x_indices) // 10)
-    fig.update_xaxes(tickmode='array', tickvals=x_indices[::step], ticktext=[date_strings[i] for i in x_indices[::step]], tickangle=-30, row=2, col=1)
+    # (6) 版面與 X 軸設定
+    fig.update_layout(
+        hovermode='x', hoverdistance=100, spikedistance=1000, height=500, margin=dict(l=10, r=10, t=30, b=10),
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="rgba(0,0,0,0)")
+    )
     
-    st.plotly_chart(fig, width="stretch")
+    # 強制 X 軸為類別屬性 (完全消滅數字索引)，並保留穿透準心
+    fig.update_xaxes(type='category', showspikes=True, spikethickness=1, spikemode='across', spikedash='dash')
+    
+    # 底部日期刻度設定
+    step = max(1, len(x_vals) // 10)
+    fig.update_xaxes(tickmode='array', tickvals=x_vals[::step], ticktext=x_vals[::step], tickangle=-30, row=2, col=1)
+    
+    st.plotly_chart(fig, width="stretch", use_container_width=True)
 
 # ==========================================
 # 3. Streamlit 前端 UI 介面
