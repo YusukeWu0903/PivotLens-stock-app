@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -12,10 +13,14 @@ st.caption(t["app_subtitle"])
 # ==========================================
 # 1. 核心資料載入與名稱對照
 # ==========================================
+# 1. 取得 app.py 所在的絕對路徑，確保雲端與本機都能精準定位檔案
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_FILE = os.path.join(BASE_DIR, "taiwan_market_cache.parquet")
+
 @st.cache_data
 def load_market_data():
     try:
-        df = pd.read_parquet("taiwan_market_cache.parquet")
+        df = pd.read_parquet(CACHE_FILE)
         df['Date'] = pd.to_datetime(df['Date'])
         return df
     except Exception as e:
@@ -23,6 +28,12 @@ def load_market_data():
         return pd.DataFrame()
 
 df_all = load_market_data()
+
+# 2. 安全防衛機制：若完全沒讀到資料，優雅停止程式，避免引發後續 KeyError
+if df_all.empty:
+    st.warning("⚠️ 目前讀取不到市場數據，請確認 taiwan_market_cache.parquet 檔案已成功推送到 GitHub 儲存庫根目錄。")
+    st.stop()
+
 stock_name_map = get_stock_name_map()
 
 def get_stock_name(stock_id):
