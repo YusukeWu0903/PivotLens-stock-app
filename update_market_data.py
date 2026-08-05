@@ -63,8 +63,8 @@ def update_market_cache_incremental():
         print("🎉 恭喜！全台股 100% 歷史資料已建立完成！")
         return
 
-    # 本次僅安全抓取 450 檔
-    batch_to_fetch = remaining_stocks[:450]
+    # 本次僅安全抓取 550 檔
+    batch_to_fetch = remaining_stocks[:550]
     print(f"🚀 本次預計批次下載【{len(batch_to_fetch)} 檔】...")
     
     new_dfs = []
