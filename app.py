@@ -11,9 +11,8 @@ st.title(t["app_title"])
 st.caption(t["app_subtitle"])
 
 # ==========================================
-# 1. 核心資料載入與名稱對照
+# 1. 核心資料載入與【O(1) 快取字典引擎】建置
 # ==========================================
-# 1. 取得 app.py 所在的絕對路徑，確保雲端與本機都能精準定位檔案
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_FILE = os.path.join(BASE_DIR, "taiwan_market_cache.parquet")
 
@@ -22,15 +21,21 @@ def load_market_data():
     try:
         df = pd.read_parquet(CACHE_FILE)
         df['Date'] = pd.to_datetime(df['Date'])
-        return df
+        
+        # 🚀 效能革命 1：將 DataFrame 轉為「字典 (Hash Map)」
+        # 讓後續取用個別股票時，速度從 O(N) 變成 O(1) 的瞬間讀取！
+        grouped = df.groupby('Stock_ID')
+        stock_dict = {stock_id: group.set_index('Date').sort_index() for stock_id, group in grouped}
+        
+        return stock_dict
     except Exception as e:
         st.error(f"❌ 無法讀取本地快取檔，請確認 taiwan_market_cache.parquet 是否存在。錯誤: {e}")
-        return pd.DataFrame()
+        return {}
 
-df_all = load_market_data()
+# 取得預先整理好的字典，取代原本厚重的 df_all
+stock_dict = load_market_data()
 
-# 2. 安全防衛機制：若完全沒讀到資料，優雅停止程式，避免引發後續 KeyError
-if df_all.empty:
+if not stock_dict:
     st.warning("⚠️ 目前讀取不到市場數據，請確認 taiwan_market_cache.parquet 檔案已成功推送到 GitHub 儲存庫根目錄。")
     st.stop()
 
@@ -39,74 +44,128 @@ stock_name_map = get_stock_name_map()
 def get_stock_name(stock_id):
     return stock_name_map.get(str(stock_id), f"{stock_id}")
 
-def fetch_stock_data_from_cache(stock_id):
-    df_single = df_all[df_all['Stock_ID'] == stock_id].copy()
-    if df_single.empty:
-        return None
-    df_single = df_single.set_index('Date').sort_index()
-    return df_single
+# ==========================================
+# 2. 策略設定與【輕量化】技術指標計算
+# ==========================================
+STRATEGY_CONFIG = {
+    "短多 (日K 5MA + 20MA)": {
+        "timeframe": "D", "short_ma": 5, "long_ma": 20, "n_days": 5,
+        "desc": "適合短線動能追蹤：抓取日線 5MA 近 5 日黃金交叉 20MA 且股價回測月線附近之標的。"
+    },
+    "中多 (日K 20MA + 60MA)": {
+        "timeframe": "D", "short_ma": 20, "long_ma": 60, "n_days": 10,
+        "desc": "適合波段佈局：抓取日線 20MA 近 10 日黃金交叉 60MA（季線）且月線斜率向上之標的。"
+    },
+    "長多 (周K 13MA + 52MA)": {
+        "timeframe": "W", "short_ma": 13, "long_ma": 52, "n_days": 20,
+        "desc": "適合大趨勢保護：抓取周線 13MA 近 20 周黃金交叉 52MA（一年）之長線趨勢發動股。"
+    },
+}
 
-# ==========================================
-# 2. 技術面計算與圖表/診斷邏輯
-# ==========================================
-def calculate_moving_averages(df, short_window, long_window):
-    df['MA_short'] = df['Close'].rolling(window=short_window).mean()
-    df['MA_long'] = df['Close'].rolling(window=long_window).mean()
-    df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
-    return df
+def process_timeframe_and_ma(df, timeframe, short_ma, long_ma):
+    """根據指定週期進行重採樣與均線計算"""
+    if timeframe == "W":
+        df_resampled = df.resample('W-FRI').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+        }).dropna()
+    else:
+        df_resampled = df.copy()
+
+    df_resampled['MA_short'] = df_resampled['Close'].rolling(window=short_ma).mean()
+    df_resampled['MA_long'] = df_resampled['Close'].rolling(window=long_ma).mean()
+    df_resampled['Vol_MA20'] = df_resampled['Volume'].rolling(window=20).mean()
+    return df_resampled
 
 @st.cache_data
-def run_market_scanner(_df_all, short_ma, long_ma, n_days, threshold, min_volume_sheets, min_price):
-    results = []
-    stock_universe = _df_all['Stock_ID'].unique()
+def run_market_scanner(_stock_dict, strategy_name, entry_pattern, min_volume_sheets, price_range, exclude_emerging=True, new_tag_days=3):
+    cfg = STRATEGY_CONFIG[strategy_name]
+    timeframe = cfg['timeframe']
+    short_ma = cfg['short_ma']
+    long_ma = cfg['long_ma']
+    n_days = cfg['n_days']
     
-    for stock_id in stock_universe:
-        df = fetch_stock_data_from_cache(stock_id)
-        if df is None or len(df) < (long_ma + 5):
-            continue
-            
-        latest_close = df['Close'].iloc[-1]
-        # 新程式碼（正確：全面無條件捨去成張數）
-        df['Volume_Sheets'] = df['Volume'] // 1000
-        raw_avg_vol = df['Volume_Sheets'].tail(20).mean()
-        avg_vol_20d = raw_avg_vol
-            
-        if avg_vol_20d < min_volume_sheets or latest_close < min_price:
-            continue
-            
-        df = calculate_moving_averages(df, short_window=short_ma, long_window=long_ma)
+    pattern_map = {
+        "貼近均線 (強效支撐)": 0.03,
+        "適度回測 (標準進場)": 0.05,
+        "允許追高 (強勢動能)": 0.08
+    }
+    threshold = pattern_map.get(entry_pattern, 0.05)
+    results = []
+    
+    for stock_id, df_raw in _stock_dict.items():
+        # 📌 興櫃與創櫃板過濾判斷
+        stock_market = df_raw['Market'].iloc[-1] if 'Market' in df_raw.columns else None
         
-        # 多方金叉判定
+        if exclude_emerging:
+            if stock_market in ["興櫃", "創櫃"]:
+                continue
+            if stock_market is None and (str(stock_id).startswith('74') or str(stock_id).startswith('75')):
+                continue
+
+        lookback_bars = 350 if timeframe == "W" else 120
+        df_slice = df_raw.tail(lookback_bars).copy()
+        
+        if len(df_slice) < 40:
+            continue
+
+        latest_close = df_slice['Close'].iloc[-1]
+        raw_avg_vol = (df_slice['Volume'] // 1000).tail(20).mean()
+        
+        if raw_avg_vol < min_volume_sheets:
+            continue
+            
+        if price_range == "高價股(100元以上)" and latest_close < 100:
+            continue
+        elif price_range == "低價股(100元以下)" and latest_close >= 100:
+            continue
+            
+        df = process_timeframe_and_ma(df_slice, timeframe, short_ma, long_ma)
+        if len(df) < (long_ma + 5):
+            continue
+
         golden_cross = (df['MA_short'] > df['MA_long']) & (df['MA_short'].shift(1) <= df['MA_long'].shift(1))
+        death_cross = (df['MA_short'] < df['MA_long']) & (df['MA_short'].shift(1) >= df['MA_long'].shift(1))
+        
+        entangled_crosses = (golden_cross | death_cross).tail(20).sum()
+        if entangled_crosses >= 3:
+            continue
+            
+        current_ma_long = df['MA_long'].iloc[-1]
+        ma_long_prev = df['MA_long'].iloc[-4] if len(df) >= 4 else current_ma_long
+        is_long_ma_up = current_ma_long > ma_long_prev
+
         recent_golden = golden_cross.tail(n_days).any()
         ma_bullish = df['MA_short'].iloc[-1] > df['MA_long'].iloc[-1]
-        current_ma_long = df['MA_long'].iloc[-1]
-        price_near = (abs(latest_close - current_ma_long) / current_ma_long) <= threshold
-        is_bullish = recent_golden and ma_bullish and price_near
+        price_near = (abs(df['Close'].iloc[-1] - current_ma_long) / current_ma_long) <= threshold
+        
+        is_selected = recent_golden and ma_bullish and price_near and is_long_ma_up
 
-        # 空方死叉判定
-        death_cross = (df['MA_short'] < df['MA_long']) & (df['MA_short'].shift(1) >= df['MA_long'].shift(1))
-        recent_death = death_cross.tail(n_days).any()
-        ma_bearish = df['MA_short'].iloc[-1] < df['MA_long'].iloc[-1]
-        is_bearish = recent_death and ma_bearish and price_near
+        if is_selected:
+            golden_indices = df[golden_cross].index
+            is_new_signal = False
+            if len(golden_indices) > 0:
+                last_cross_date = golden_indices[-1]
+                days_since_cross = (df.index[-1] - last_cross_date).days
+                if days_since_cross <= (new_tag_days * (7 if timeframe == "W" else 1)):
+                    is_new_signal = True
 
-        if is_bullish or is_bearish:
             results.append({
+                "Is_New": is_new_signal,
                 "股票代號": stock_id,
                 "股票名稱": get_stock_name(stock_id),
                 "最新收盤價": round(latest_close, 2),
-                "20日均量(張)": int(avg_vol_20d),
-                "距長均線(%)": round((latest_close - current_ma_long) / current_ma_long * 100, 2),
-                "訊號類型": "多方" if is_bullish else "空方",
+                "20日均量(張)": int(raw_avg_vol),
+                "距長均線(%)": round((df['Close'].iloc[-1] - current_ma_long) / current_ma_long * 100, 2),
+                "週期形態": "周K" if timeframe == "W" else "日K",
                 "資料日期": df.index[-1].strftime('%Y-%m-%d')
             })
             
     return pd.DataFrame(results)
 
-def calculate_historical_win_rate(df, short_ma, long_ma, signal_type, n_days=15, threshold=0.04):
+def calculate_historical_win_rate(df, short_ma, long_ma, signal_type="多方", n_days=15, threshold=0.04):
     df_calc = df.copy()
-    cross = (df_calc['MA_short'] > df_calc['MA_long']) & (df_calc['MA_short'].shift(1) <= df_calc['MA_long'].shift(1)) if signal_type == "多方" else (df_calc['MA_short'] < df_calc['MA_long']) & (df_calc['MA_short'].shift(1) >= df_calc['MA_long'].shift(1))
-    order = df_calc['MA_short'] > df_calc['MA_long'] if signal_type == "多方" else df_calc['MA_short'] < df_calc['MA_long']
+    cross = (df_calc['MA_short'] > df_calc['MA_long']) & (df_calc['MA_short'].shift(1) <= df_calc['MA_long'].shift(1))
+    order = df_calc['MA_short'] > df_calc['MA_long']
     
     recent_cross = cross.rolling(window=n_days).max() > 0
     price_near = (abs(df_calc['Close'] - df_calc['MA_long']) / df_calc['MA_long']) <= threshold
@@ -124,7 +183,7 @@ def calculate_historical_win_rate(df, short_ma, long_ma, signal_type, n_days=15,
             if loc + hold_days < len(df_calc):
                 exit_date = df_calc.index[loc + hold_days]
                 future_price = df_calc['Close'].iloc[loc + hold_days]
-                ret = (future_price - entry_price) / entry_price if signal_type == "多方" else (entry_price - future_price) / entry_price
+                ret = (future_price - entry_price) / entry_price
                 res[f'ret_{hold_days}d'] = ret
                 res[f'win_{hold_days}d'] = 1 if ret > 0 else 0
                 log_entry[t["log_exit_date"].format(days=hold_days)] = exit_date.strftime('%Y-%m-%d')
@@ -144,14 +203,19 @@ def calculate_historical_win_rate(df, short_ma, long_ma, signal_type, n_days=15,
             summary[f'avg_ret_{hold_days}d'] = round(df_res[f'ret_{hold_days}d'].mean() * 100, 2)
     return summary, df_logs
 
-def render_kline_chart(stock_id, short_ma, long_ma, signal_type):
-    df_selected = fetch_stock_data_from_cache(stock_id)
-    if df_selected is None:
+def render_kline_chart(stock_id, strategy_name):
+    cfg = STRATEGY_CONFIG[strategy_name]
+    timeframe = cfg['timeframe']
+    short_ma = cfg['short_ma']
+    long_ma = cfg['long_ma']
+
+    df_raw = stock_dict.get(stock_id)
+    if df_raw is None:
         return
-    df_selected = calculate_moving_averages(df_selected, short_ma, long_ma)
     
-    # 1. 技術面診斷與歷史勝率
-    stats, trade_logs_df = calculate_historical_win_rate(df_selected, short_ma, long_ma, signal_type)
+    df_selected = process_timeframe_and_ma(df_raw, timeframe, short_ma, long_ma)
+    
+    stats, trade_logs_df = calculate_historical_win_rate(df_selected, short_ma, long_ma)
     latest_close = df_selected['Close'].iloc[-1]
     prev_close = df_selected['Close'].iloc[-2]
     price_change_pct = ((latest_close - prev_close) / prev_close) * 100
@@ -173,39 +237,31 @@ def render_kline_chart(stock_id, short_ma, long_ma, signal_type):
 
     with col_diag:
         st.markdown(f"##### {t['diag_header']}")
-        if signal_type == "多方":
-            if is_price_up and is_vol_low: st.success(t["diag_bull_up_lowvol"].format(pct=price_change_pct, ma_val=long_ma_val, long_ma=long_ma))
-            elif is_price_up: st.success(t["diag_bull_up_highvol"].format(pct=price_change_pct))
-            elif is_vol_low: st.info(t["diag_bull_down_lowvol"].format(pct=price_change_pct, ma_val=long_ma_val))
-            else: st.warning(t["diag_bull_down_highvol"].format(pct=price_change_pct, ma_val=long_ma_val))
-        else:
-            if not is_price_up and not is_vol_low: st.error(t["diag_bear_down_highvol"].format(pct=price_change_pct, ma_val=long_ma_val, long_ma=long_ma))
-            elif is_price_up: st.info(t["diag_bear_up"].format(pct=price_change_pct, ma_val=long_ma_val))
-            else: st.warning(t["diag_bear_down_lowvol"].format(pct=price_change_pct))
+        if is_price_up and is_vol_low: st.success(t["diag_bull_up_lowvol"].format(pct=price_change_pct, ma_val=long_ma_val, long_ma=long_ma))
+        elif is_price_up: st.success(t["diag_bull_up_highvol"].format(pct=price_change_pct))
+        elif is_vol_low: st.info(t["diag_bull_down_lowvol"].format(pct=price_change_pct, ma_val=long_ma_val))
+        else: st.warning(t["diag_bull_down_highvol"].format(pct=price_change_pct, ma_val=long_ma_val))
 
     if trade_logs_df is not None and not trade_logs_df.empty:
         with st.expander(t["expander_logs"]): st.dataframe(trade_logs_df, width="stretch")
 
     st.divider()
 
-    # 2. 準備圖表資料與單位換算
     df_chart = df_selected.tail(90).reset_index()
     df_chart['Volume_Sheets'] = df_chart['Volume'] // 1000
     df_chart['Prev_Close'] = df_chart['Close'].shift(1).fillna(df_chart['Open'])
     
-    # 📌 關鍵修正 1：直接使用日期字串作為 X 軸，這樣游標對齊時跳出來的就會是「2026-08-04」而不是「87」！
     date_strings = df_chart['Date'].dt.strftime('%Y-%m-%d').tolist()
     x_vals = date_strings 
 
     vol_hover_texts = []
     combined_texts = [] 
     
-    # 📌 關鍵修正 2：把 K 棒顏色與替身文字的迴圈「合併」，找回失去的紅綠色！
+    tf_label = "周" if timeframe == "W" else "日"
+
     for idx, row in df_chart.iterrows():
-        # 成交量
-        vol_hover_texts.append(f"<b>{date_strings[idx]}</b><br>成交量: {row['Volume_Sheets']:,} 張")
+        vol_hover_texts.append(f"<b>{date_strings[idx]} ({tf_label}K)</b><br>成交量: {row['Volume_Sheets']:,} 張")
         
-        # K 棒顏色判斷
         prev_c = row['Prev_Close']
         def get_color_str(val, base):
             if val > base: return f"<span style='color:#ef5350;'>{val:.2f} ▲</span>"
@@ -217,44 +273,37 @@ def render_kline_chart(stock_id, short_ma, long_ma, signal_type):
         low_html = get_color_str(row['Low'], prev_c)
         close_html = get_color_str(row['Close'], prev_c)
 
-        # 組裝成一個包含所有資訊、且帶有顏色的完美對話框
         text = (
-            f"<b>{date_strings[idx]}</b><br><br>"
+            f"<b>{date_strings[idx]} ({tf_label}K)</b><br><br>"
             f"{t['chart_open']}: {open_html}<br>"
             f"{t['chart_high']}: {high_html}<br>"
             f"{t['chart_low']}: {low_html}<br>"
             f"{t['chart_close']}: {close_html}<br><br>"
-            f"<span style='color:#ffa726;'>{short_ma}MA: {row['MA_short']:.2f}</span><br>"
-            f"<span style='color:#42a5f5;'>{long_ma}MA: {row['MA_long']:.2f}</span>"
+            f"<span style='color:#ffa726;'>{short_ma}{tf_label}MA: {row['MA_short']:.2f}</span><br>"
+            f"<span style='color:#42a5f5;'>{long_ma}{tf_label}MA: {row['MA_long']:.2f}</span>"
         )
         combined_texts.append(text)
 
-    # 3. 繪製圖表
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
 
-    # (1) 隱形追蹤器 (綁定帶有顏色的 combined_texts)
     fig.add_trace(go.Scatter(
         x=x_vals, y=df_chart['Close'], mode='lines', line=dict(color='rgba(0,0,0,0)'), 
         text=combined_texts, hovertemplate="%{text}<extra></extra>", showlegend=False, hoverinfo="text"
     ), row=1, col=1)
 
-    # (2) K 線圖 (hoverinfo='skip')
     fig.add_trace(go.Candlestick(
         x=x_vals, open=df_chart['Open'], high=df_chart['High'], low=df_chart['Low'], close=df_chart['Close'], 
-        name=t['chart_kline'], increasing_line_color='#ef5350', decreasing_line_color='#26a69a', hoverinfo='skip'
+        name=f"{tf_label}K線", increasing_line_color='#ef5350', decreasing_line_color='#26a69a', hoverinfo='skip'
     ), row=1, col=1)
 
-    # (3) 短均線 (hoverinfo='skip')
     fig.add_trace(go.Scatter(
-        x=x_vals, y=df_chart['MA_short'], name=f"{short_ma}MA", line=dict(color='orange', width=1.5), hoverinfo='skip'
+        x=x_vals, y=df_chart['MA_short'], name=f"{short_ma}{tf_label}MA", line=dict(color='orange', width=1.5), hoverinfo='skip'
     ), row=1, col=1)
 
-    # (4) 長均線 (hoverinfo='skip')
     fig.add_trace(go.Scatter(
-        x=x_vals, y=df_chart['MA_long'], name=f"{long_ma}MA", line=dict(color='#42a5f5', width=1.5), hoverinfo='skip'
+        x=x_vals, y=df_chart['MA_long'], name=f"{long_ma}{tf_label}MA", line=dict(color='#42a5f5', width=1.5), hoverinfo='skip'
     ), row=1, col=1)
     
-    # (5) 成交量柱狀圖
     price_diff = df_chart['Close'].diff().fillna(0)
     vol_colors = ['#ef5350' if diff >= 0 else '#26a69a' for diff in price_diff]
     fig.add_trace(go.Bar(
@@ -262,17 +311,14 @@ def render_kline_chart(stock_id, short_ma, long_ma, signal_type):
         marker_color=vol_colors, opacity=0.7, hoverinfo="text", hovertext=vol_hover_texts
     ), row=2, col=1)
 
-    # (6) 版面與 X 軸設定
     fig.update_layout(
         hovermode='x', hoverdistance=100, spikedistance=1000, height=500, margin=dict(l=10, r=10, t=30, b=10),
         xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="rgba(0,0,0,0)")
     )
     
-    # 強制 X 軸為類別屬性 (完全消滅數字索引)，並保留穿透準心
     fig.update_xaxes(type='category', showspikes=True, spikethickness=1, spikemode='across', spikedash='dash')
     
-    # 底部日期刻度設定
     step = max(1, len(x_vals) // 10)
     fig.update_xaxes(tickmode='array', tickvals=x_vals[::step], ticktext=x_vals[::step], tickangle=-30, row=2, col=1)
     
@@ -281,42 +327,84 @@ def render_kline_chart(stock_id, short_ma, long_ma, signal_type):
 # ==========================================
 # 3. Streamlit 前端 UI 介面
 # ==========================================
-st.sidebar.header("⚙️ 參數設定")
-min_vol = st.sidebar.number_input("最低 20 日均量 (張)", value=500)
-min_price = st.sidebar.number_input("最低股價 (元)", value=10.0)
-short_ma = st.sidebar.number_input("短均線天數 (MA)", value=5)
-long_ma = st.sidebar.number_input("長均線天數 (MA)", value=20)
-n_days = st.sidebar.slider("近期交叉天數", 5, 30, 15)
-threshold_pct = st.sidebar.slider("均線容錯極限 (%)", 0.5, 10.0, 4.0)
+st.sidebar.header("🎯 策略選擇")
 
-if st.button("🚀 執行全市場轉折掃描", type="primary"):
-    with st.spinner("正在記憶體中掃描全台股標的..."):
-        scan_df = run_market_scanner(df_all, short_ma, long_ma, n_days, threshold_pct/100.0, min_vol, min_price)
-        st.session_state['scan_df'] = scan_df
+strategy_name = st.sidebar.selectbox(
+    "選擇選股模式",
+    options=list(STRATEGY_CONFIG.keys()),
+    index=0
+)
+
+st.sidebar.divider()
+st.sidebar.subheader("⚙️ 選股池設定")
+
+filter_high_vol = st.sidebar.checkbox("僅篩選 20 日均量 ≥ 1000 張 (預設)", value=True)
+min_vol = 1000 if filter_high_vol else 0
+
+exclude_emerging = st.sidebar.checkbox("排除興櫃與創櫃板 (預設)", value=True)
+
+price_range = st.sidebar.selectbox(
+    "股價區間",
+    options=["高價股(100元以上)", "低價股(100元以下)"],
+    index=0
+)
+
+entry_pattern = st.sidebar.selectbox(
+    "買點型態",
+    options=["貼近均線 (強效支撐)", "適度回測 (標準進場)", "允許追高 (強勢動能)"],
+    index=0,
+    help="貼近均線代表股價剛拉回長均線支撐附近，進場風險最低。"
+)
+
+with st.spinner(f"正在以【{strategy_name}】模式掃描全台股..."):
+    scan_df = run_market_scanner(
+        stock_dict, strategy_name, entry_pattern, min_vol, price_range, exclude_emerging, new_tag_days=3
+    )
 
 st.divider()
 
-if 'scan_df' in st.session_state and not st.session_state['scan_df'].empty:
-    scan_df = st.session_state['scan_df']
-    bull_df = scan_df[scan_df['訊號類型'] == '多方'].drop(columns=['訊號類型'])
-    bear_df = scan_df[scan_df['訊號類型'] == '空方'].drop(columns=['訊號類型'])
+# ==========================================
+# 4. 顯示掃描結果與說明卡片
+# ==========================================
+if scan_df is not None and not scan_df.empty:
+    cfg = STRATEGY_CONFIG[strategy_name]
     
-    tab_bull, tab_bear = st.tabs([t["tab_bull"].format(count=len(bull_df)), t["tab_bear"].format(count=len(bear_df))])
+    vol_text = "≥ **1000** 張 (主流流動性)" if filter_high_vol else "**包含 1000 張以下標的** (全市場)"
+    price_text = "≥ **100** 元 (高價股)" if price_range == "高價股(100元以上)" else "< **100** 元 (低價股)"
+    market_text = "上市/上櫃" if exclude_emerging else "全市場 (含興櫃/創櫃)"
+    curr_n_days = cfg['n_days']
+    tf_unit = "周" if cfg['timeframe'] == "W" else "日"
     
-    with tab_bull:
-        if not bull_df.empty:
-            st.dataframe(bull_df, width="stretch")
-            st.markdown(f"##### {t['select_stock_prompt']}")
-            selected_bull = st.selectbox(t["select_bull_label"], options=[f"{row['股票代號']} - {row['股票名稱']}" for _, row in bull_df.iterrows()], key="select_bull")
-            if selected_bull:
-                render_kline_chart(selected_bull.split(" - ")[0], short_ma, long_ma, "多方")
-        else: st.info(t["no_bull_msg"])
+    st.subheader(f"📊 掃描結果：{strategy_name}")
+    st.info(
+        f"💡 **篩選邏輯說明**：\n"
+        f"* **核心策略**：{cfg['desc']}\n"
+        f"* **過濾條件**：市場別：**{market_text}** | 20 日均量 {vol_text} | 股價 {price_text} | "
+        f"近 **{curr_n_days}** 根 {tf_unit}K 棒內交叉 | 買點位置：**{entry_pattern}**\n"
+        f"* **自動洗盤防禦**：排除近 20 根 K 棒交叉 3 次以上之均線糾結橫盤股。"
+    )
 
-    with tab_bear:
-        if not bear_df.empty:
-            st.dataframe(bear_df, width="stretch")
-            st.markdown(f"##### {t['select_stock_prompt']}")
-            selected_bear = st.selectbox(t["select_bear_label"], options=[f"{row['股票代號']} - {row['股票名稱']}" for _, row in bear_df.iterrows()], key="select_bear")
-            if selected_bear:
-                render_kline_chart(selected_bear.split(" - ")[0], short_ma, long_ma, "空方")
-        else: st.info(t["no_bear_msg"])
+    new_count = scan_df['Is_New'].sum()
+    st.caption(f"共掃描出 **{len(scan_df)}** 檔標的（其中 **{new_count}** 檔為近 3 天內剛交叉的 **NEW** 標的）")
+
+    scan_df = scan_df.sort_values(by=['Is_New', '距長均線(%)'], ascending=[False, True])
+    
+    st.markdown(f"##### {t['select_stock_prompt']}")
+    
+    options = [
+        f"{row['股票代號']} - {row['股票名稱']}{' (NEW)' if row['Is_New'] else ''}"
+        for _, row in scan_df.iterrows()
+    ]
+    
+    selected_stock = st.selectbox(
+        "請選擇股票查看分析與圖表：",
+        options=options,
+        key="selected_stock"
+    )
+    
+    if selected_stock:
+        stock_id = selected_stock.split(" - ")[0].strip()
+        render_kline_chart(stock_id, strategy_name)
+
+else:
+    st.info("ℹ️ 當前條件下未找到符合策略之股票，請嘗試切換其他股價區間或買點型態。")
