@@ -10,7 +10,7 @@ if not token:
 else:
     url = "https://api.web.finmindtrade.com/v2/user_info"
     headers = {"Authorization": f"Bearer {token}"}
-    
+
     try:
         response = requests.get(url, headers=headers)
         if response.status_code == 200:
@@ -18,11 +18,11 @@ else:
             # 根據 FinMind 官方文件解析欄位
             user_count = data.get("user_count", "未知")
             api_limit = data.get("api_request_limit", "未知")
-            
+
             print("=" * 40)
             print("📊 FinMind API 額度狀態查詢")
             print("=" * 40)
-            print(print(f"🔹 目前已使用次數: {user_count}"))
+            print(f"🔹 目前已使用次數: {user_count}")
             print(f"🔹 每小時請求上限: {api_limit}")
             print("=" * 40)
         else:
