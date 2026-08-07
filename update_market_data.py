@@ -10,13 +10,17 @@ import requests
 load_dotenv()
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_FILE = os.path.join(BASE_DIR, "taiwan_market_cache.parquet")
+# 使用分層儲存目錄，取代單一 parquet 檔案
+CACHE_DIR = os.path.join(BASE_DIR, "market_cache")
 BLACKLIST_FILE = os.path.join(BASE_DIR, "blacklist.txt")
+
+# 大盤指數代碼 (FinMind API 使用的代碼)
+MARKET_INDICES = ["TAIEX", "TPEx"]
 
 # 可配置的多執行緒數量（預設 5，可透過環境變數覆蓋）
 MAX_WORKERS = int(os.getenv("UPDATE_MAX_WORKERS", "5"))
-# 單次執行最大更新檔數（避免超過 API 時限）
-MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "550"))
+# 單次執行最大更新檔數：552 = 2 檔大盤指數 + 550 檔熱門股
+MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "552"))
 # 中途存檔間隔
 CHECKPOINT_INTERVAL = int(os.getenv("UPDATE_CHECKPOINT_INTERVAL", "110"))
 # 請求間隔（秒）
@@ -41,6 +45,40 @@ def fetch_single_stock_daily(dl: DataLoader, stock_id: str, start_date: str, end
     return None
 
 
+def get_tier(rank: int) -> str:
+    """
+    根據優先級排名決定儲存分層
+    Rank 1~552  -> tier1_hot  (第一批：大盤指數 + 550 檔熱門股)
+    Rank 553~1102 -> tier2_warm (第二批：550 檔中型股)
+    Rank 1103~    -> tier3_cold (其餘冷門股)
+    """
+    if rank <= 552:
+        return "tier1_hot"
+    elif rank <= 1102:
+        return "tier2_warm"
+    else:
+        return "tier3_cold"
+
+
+def read_existing_cache() -> pd.DataFrame:
+    """
+    讀取分層儲存的快取資料
+    回傳合併後的 DataFrame，若無資料則回傳空 DataFrame
+    """
+    if not os.path.exists(CACHE_DIR):
+        return pd.DataFrame()
+    
+    try:
+        # 讀取分區 parquet 目錄
+        df = pd.read_parquet(CACHE_DIR)
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'])
+        return df
+    except Exception as e:
+        print(f"⚠️ 讀取舊快取失敗: {e}")
+        return pd.DataFrame()
+
+
 def update_market_cache():
     if not FINMIND_TOKEN:
         print("❌ 錯誤：未在 .env 中找到 FINMIND_TOKEN，請檢查設定。")
@@ -63,10 +101,17 @@ def update_market_cache():
     print("⏳ 正在獲取全台股清單...")
     try:
         df_info = dl.taiwan_stock_info()
+        # 一般股票：4 位數代碼，非 ETF/存託憑證/受益證券
         all_stocks = df_info[
             (~df_info['industry_category'].isin(['ETF', '存託憑證', '受益證券', ''])) &
             (df_info['stock_id'].str.len() == 4)
         ]['stock_id'].unique().tolist()
+        
+        # 🚀 VIP 霸王條款：強制加入大盤指數（不受 4 位數限制）
+        for idx in MARKET_INDICES:
+            if idx not in all_stocks:
+                all_stocks.insert(0, idx)
+                
     except Exception as e:
         print(f"\n⚠️ 無法取得股票清單: {e}")
         return
@@ -78,14 +123,8 @@ def update_market_cache():
             blacklist = set(f.read().splitlines())
     all_stocks = [s for s in all_stocks if s not in blacklist]
 
-    # 讀取本地既有 Parquet
-    existing_df = pd.DataFrame()
-    if os.path.exists(CACHE_FILE):
-        try:
-            existing_df = pd.read_parquet(CACHE_FILE)
-            existing_df['Date'] = pd.to_datetime(existing_df['Date'])
-        except Exception as e:
-            print(f"⚠️ 讀取舊快取失敗: {e}")
+    # 讀取本地既有 Parquet (分層儲存)
+    existing_df = read_existing_cache()
 
     # ==========================================
     # 📌 終極修復：統一計算「哪些股票真的需要更新？」
@@ -119,15 +158,20 @@ def update_market_cache():
         return
 
     # ==========================================
-    # 🚀 新增：基於歷史 20 日均量的動態優先級排序
+    # 🚀 新增：基於歷史 20 日均量的動態優先級排序 + VIP 霸王條款
     # ==========================================
     # 只在有既有資料時才計算均量排序；冷啟動時跳過，保持原順序
     if not existing_df.empty:
         # 計算每檔股票近 20 日平均成交量 (零 API 成本，純本地運算)
         vol_rank = existing_df.groupby("Stock_ID")["Volume"].apply(lambda x: x.tail(20).mean()).to_dict()
+        
+        # 🏆 VIP 霸王條款：大盤指數強制設為無限大，保證排第 1、2 名
+        for idx in MARKET_INDICES:
+            vol_rank[idx] = float('inf')
+        
         # 依均量由大到小排序；無歷史資料的新股票預設為 0 (排最後)
         needs_update.sort(key=lambda sid: vol_rank.get(sid, 0), reverse=True)
-        print(f"🔥 已依據歷史 20 日均量完成優先級排序，將優先更新成交量前 {MAX_STOCKS_PER_RUN} 大標的")
+        print(f"🔥 已依據歷史 20 日均量完成優先級排序（大盤指數 VIP 置頂），將優先更新前 {MAX_STOCKS_PER_RUN} 大標的")
     else:
         print("⚡ 冷啟動模式：本地無歷史資料，跳過均量排序，依原順序更新")
 
@@ -135,7 +179,9 @@ def update_market_cache():
     target_stocks = needs_update[:MAX_STOCKS_PER_RUN]
 
     print(f"📊 總計掛牌: {len(all_stocks)} 檔 | 尚待更新: {len(needs_update)} 檔")
-    print(f"🚀 本次批次安全下載【{len(target_stocks)} 檔】(max_workers={MAX_WORKERS})...")
+    print(f"🚀 本次批次安全下載【{len(target_stocks)} 檔】(max_workers={MAX_WORKERS})")
+    if "TAIEX" in target_stocks and "TPEx" in target_stocks:
+        print(f"   🏆 VIP 確認：TAIEX、TPEx 已鎖定優先更新")
 
     new_dfs = []
     failed_stocks = []
@@ -169,7 +215,8 @@ def update_market_cache():
                     temp_df['Date'] = pd.to_datetime(temp_df['Date'])
                     temp_final = pd.concat([existing_df, temp_df], ignore_index=True) if not existing_df.empty else temp_df
                     temp_final = temp_final.drop_duplicates(subset=['Stock_ID', 'Date']).sort_values(['Stock_ID', 'Date'])
-                    temp_final.to_parquet(CACHE_FILE, index=False)
+                    # 分層儲存
+                    temp_final.to_parquet(CACHE_DIR, index=False, partition_cols=['Tier'])
 
             if completed % 50 == 0 or completed == len(target_stocks):
                 print(f"⏳ 進度: {completed}/{len(target_stocks)}")
@@ -184,7 +231,7 @@ def update_market_cache():
                 f.write(f"{sid}\n")
         print(f"🚫 發現 {len(real_dead_stocks)} 檔無法取得歷史資料，已永久加入黑名單！")
 
-    # 📌 550 檔跑完，最終完整存檔！
+    # 📌 最終完整存檔：加入 Tier 分層欄位並分區寫入
     if new_dfs:
         df_batch = pd.concat(new_dfs, ignore_index=True)
         df_batch = df_batch.rename(columns={
@@ -195,11 +242,34 @@ def update_market_cache():
 
         final_df = pd.concat([existing_df, df_batch], ignore_index=True) if not existing_df.empty else df_batch
         final_df = final_df.drop_duplicates(subset=['Stock_ID', 'Date']).sort_values(['Stock_ID', 'Date'])
-        final_df.to_parquet(CACHE_FILE, index=False)
+        
+        # 🚀 關鍵：為每筆資料加上 Tier 分層標籤
+        # 重新計算最新的 vol_rank 以獲得正確排名
+        if not existing_df.empty:
+            latest_vol_rank = final_df.groupby("Stock_ID")["Volume"].apply(lambda x: x.tail(20).mean()).to_dict()
+            for idx in MARKET_INDICES:
+                latest_vol_rank[idx] = float('inf')
+            # 產生完整排序列表
+            all_sids = list(latest_vol_rank.keys())
+            all_sids.sort(key=lambda sid: latest_vol_rank.get(sid, 0), reverse=True)
+            # 映射 Tier
+            tier_map = {sid: get_tier(rank + 1) for rank, sid in enumerate(all_sids)}
+        else:
+            # 冷啟動：依 all_stocks 順序
+            tier_map = {sid: get_tier(rank + 1) for rank, sid in enumerate(all_stocks)}
+        
+        final_df['Tier'] = final_df['Stock_ID'].map(tier_map).fillna('tier3_cold')
+        
+        # 分區寫入：partition_cols=['Tier'] 會自動建立 tier1_hot/、tier2_warm/、tier3_cold/ 子目錄
+        final_df.to_parquet(CACHE_DIR, index=False, partition_cols=['Tier'])
 
         updated_total = len(final_df['Stock_ID'].unique())
         new_latest_date = final_df['Date'].max().strftime('%Y-%m-%d')
+        
+        # 統計各 Tier 筆數
+        tier_counts = final_df['Tier'].value_counts().to_dict()
         print(f"✅ 本批次 {len(target_stocks)} 檔存檔成功！全台股覆蓋率: {updated_total}/{len(all_stocks)} | 最新日期: {new_latest_date}")
+        print(f"   📦 分層統計: {tier_counts}")
 
         # 🔔 完美提醒！
         if len(needs_update) > MAX_STOCKS_PER_RUN:
