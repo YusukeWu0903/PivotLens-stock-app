@@ -11,10 +11,11 @@ import pandas as pd
 # ==========================================
 # 常數定義
 # ==========================================
+# 買點型態區間映射：(min_thresh, max_thresh) 互斥區間
 PATTERN_THRESHOLD_MAP = {
-    "貼近均線 (強效支撐)": 0.03,
-    "適度回測 (標準進場)": 0.05,
-    "允許追高 (強勢動能)": 0.08,
+    "貼近均線 (強效支撐)": (0.00, 0.03),
+    "適度回測 (標準進場)": (0.03, 0.05),
+    "允許追高 (強勢動能)": (0.05, 0.08),
 }
 
 
@@ -171,7 +172,7 @@ def run_market_scanner(
     long_ma = cfg["long_ma"]
     n_days = cfg["n_days"]
 
-    threshold = PATTERN_THRESHOLD_MAP.get(entry_pattern, 0.05)
+    min_thresh, max_thresh = PATTERN_THRESHOLD_MAP.get(entry_pattern, (0.00, 0.05))
     results = []
 
     for stock_id, df_raw in stock_dict.items():
@@ -222,9 +223,19 @@ def run_market_scanner(
         ma_long_prev = df["MA_long"].iloc[-4] if len(df) >= 4 else current_ma_long
         is_long_ma_up = current_ma_long > ma_long_prev
 
+        # 🛡️ 防禦性檢查：若 MA_long 為 NaN 或 0 (資料不足/異常) 則跳過
+        if pd.isna(current_ma_long) or current_ma_long == 0:
+            continue
+
         recent_golden = golden_cross.tail(n_days).any()
         ma_bullish = df["MA_short"].iloc[-1] > df["MA_long"].iloc[-1]
-        price_near = (abs(df["Close"].iloc[-1] - current_ma_long) / current_ma_long) <= threshold
+        
+        # 📌 區間互斥邏輯：根據買點型態決定價格距離區間
+        dist = abs(df["Close"].iloc[-1] - current_ma_long) / current_ma_long
+        if min_thresh == 0.0:
+            price_near = dist <= max_thresh
+        else:
+            price_near = (dist > min_thresh) and (dist <= max_thresh)
 
         is_selected = recent_golden and ma_bullish and price_near and is_long_ma_up
 
