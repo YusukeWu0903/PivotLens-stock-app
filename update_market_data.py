@@ -65,22 +65,33 @@ def get_tier(rank: int) -> str:
 
 
 def read_existing_cache() -> pd.DataFrame:
-    """
-    讀取分層儲存的快取資料
-    回傳合併後的 DataFrame，若無資料則回傳空 DataFrame
-    """
-    if not os.path.exists(CACHE_DIR):
-        return pd.DataFrame()
+    """讀取主快取與中途暫存檔，進行災難復原合併"""
+    df_main = pd.DataFrame()
+    df_checkpoint = pd.DataFrame()
     
-    try:
-        # 讀取分區 parquet 目錄
-        df = pd.read_parquet(CACHE_DIR)
-        if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'])
-        return df
-    except Exception as e:
-        print(f"⚠️ 讀取舊快取失敗: {e}")
+    if os.path.exists(CACHE_DIR):
+        try:
+            df_main = pd.read_parquet(CACHE_DIR)
+        except Exception as e:
+            print(f"⚠️ 讀取主快取失敗: {e}")
+            
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            df_checkpoint = pd.read_parquet(CHECKPOINT_FILE)
+            print(f"♻️ 偵測到中斷暫存檔，已自動載入 {len(df_checkpoint)} 筆復原資料！")
+        except Exception as e:
+            print(f"⚠️ 讀取暫存檔失敗: {e}")
+            
+    if df_main.empty and df_checkpoint.empty:
         return pd.DataFrame()
+        
+    combined_df = pd.concat([df_main, df_checkpoint], ignore_index=True)
+    if 'Date' in combined_df.columns:
+        combined_df['Date'] = pd.to_datetime(combined_df['Date'])
+        
+    # 去除重複值 (以暫存檔的最新資料為準)
+    combined_df = combined_df.drop_duplicates(subset=['Stock_ID', 'Date'], keep='last')
+    return combined_df
 
 
 def update_market_cache():
@@ -263,6 +274,14 @@ def update_market_cache():
         if 'Tier' not in final_df.columns:
             final_df['Tier'] = 'tier3_cold'
         
+        # 🛡️ 破除 Categorical 限制：將 Tier 強制轉為字串
+        if 'Tier' in final_df.columns:
+            final_df['Tier'] = final_df['Tier'].astype(str)
+            final_df['Tier'] = final_df['Tier'].replace(['nan', 'None'], pd.NA)
+            
+        if 'Tier' not in final_df.columns:
+            final_df['Tier'] = 'tier3_cold'
+        
         # 找出「既有 Tier」的股票（來自 existing_df 的 Tier 欄位）
         if not existing_df.empty and 'Tier' in existing_df.columns:
             stocks_with_tier = existing_df[existing_df['Tier'].notna() & (existing_df['Tier'] != '')]['Stock_ID'].unique()
@@ -291,6 +310,11 @@ def update_market_cache():
         
         # 分區寫入：partition_cols=['Tier'] 會自動建立 tier1_hot/、tier2_warm/、tier3_cold/ 子目錄
         final_df.to_parquet(CACHE_DIR, index=False, partition_cols=['Tier'])
+
+        # 🧹 清除階段性任務完成的暫存檔
+        if os.path.exists(CHECKPOINT_FILE):
+            os.remove(CHECKPOINT_FILE)
+            print(f"🧹 已清除階段性暫存檔 ({CHECKPOINT_FILE})")
 
         updated_total = len(final_df['Stock_ID'].unique())
         new_latest_date = final_df['Date'].max().strftime('%Y-%m-%d')
