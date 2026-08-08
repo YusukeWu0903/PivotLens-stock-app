@@ -27,14 +27,16 @@ st.caption(t["app_subtitle"])
 # 核心資料載入 (帶快取)
 # ==========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_FILE = os.path.join(BASE_DIR, "taiwan_market_cache.parquet")
+# 讀取新的分層快取目錄
+CACHE_DIR = os.path.join(BASE_DIR, "market_cache")
 
 
 @st.cache_data
 def load_market_data():
     """載入市場資料並轉為字典引擎 (O(1) 查詢)"""
     try:
-        df = pd.read_parquet(CACHE_FILE)
+        # 讀取分層 parquet 目錄
+        df = pd.read_parquet(CACHE_DIR)
         df["Date"] = pd.to_datetime(df["Date"])
 
         # 轉為 {stock_id: DataFrame} 字典
@@ -45,7 +47,7 @@ def load_market_data():
         }
         return stock_dict
     except Exception as e:
-        st.error(f"❌ 無法讀取本地快取檔，請確認 taiwan_market_cache.parquet 是否存在。錯誤: {e}")
+        st.error(f"❌ 無法讀取本地快取檔，請確認 market_cache/ 目錄是否存在。錯誤: {e}")
         return {}
 
 
@@ -54,7 +56,7 @@ stock_dict = load_market_data()
 
 if not stock_dict:
     st.warning(
-        "⚠️ 目前讀取不到市場數據，請確認 taiwan_market_cache.parquet 檔案已成功推送到 GitHub 儲存庫根目錄。"
+        "⚠️ 目前讀取不到市場數據，請確認 market_cache/ 目錄已成功建立。"
     )
     st.stop()
 
@@ -147,13 +149,14 @@ if scan_df is not None and not scan_df.empty:
     tf_unit = "周" if cfg["timeframe"] == "W" else "日"
 
     st.subheader(f"📊 掃描結果：{strategy_name}")
-    st.info(
-        f"💡 **篩選邏輯說明**：\\n"
-        f"* **核心策略**：{cfg['desc']}\\n"
-        f"* **過濾條件**：市場別：**{market_text}** | 20 日均量 {vol_text} | 股價 {price_text} | "
-        f"近 **{curr_n_days}** 根 {tf_unit}K 棒內交叉 | 買點位置：**{entry_pattern}**\\n"
-        f"* **自動洗盤防禦**：排除近 20 根 K 棒交叉 3 次以上之均線糾結橫盤股。"
-    )
+    st.info("💡 **篩選邏輯說明**："
+            "" + chr(10) + chr(10) + ""
+            "* **核心策略**：" + cfg['desc'] + ""
+            "" + chr(10) + chr(10) + ""
+            "* **過濾條件**：市場別：**" + market_text + "** | 20 日均量 " + vol_text + " | 股價 " + price_text + " | "
+            "近 **" + str(curr_n_days) + "** 根 " + tf_unit + "K 棒內交叉 | 買點位置：**" + entry_pattern + "**"
+            "" + chr(10) + chr(10) + ""
+            "* **自動洗盤防禦**：排除近 20 根 K 棒交叉 3 次以上之均線糾結橫盤股。")
 
     new_count = scan_df["Is_New"].sum()
     st.caption(

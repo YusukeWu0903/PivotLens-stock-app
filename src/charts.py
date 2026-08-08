@@ -247,8 +247,19 @@ def process_timeframe_for_chart(
     long_ma: int
 ) -> pd.DataFrame:
     """為圖表處理時間框架與均線 (內部使用)"""
+    # 🛡️ 確保索引是 DatetimeIndex，並移除重複日期
+    df_work = df.copy()
+    if not isinstance(df_work.index, pd.DatetimeIndex):
+        if "Date" in df_work.columns:
+            df_work = df_work.set_index("Date")
+        df_work.index = pd.to_datetime(df_work.index)
+    df_work = df_work.sort_index()
+    
+    # 🛡️ 移除重複日期（保留最後一筆）
+    df_work = df_work[~df_work.index.duplicated(keep='last')]
+    
     if timeframe == "W":
-        df_resampled = df.resample("W-FRI").agg({
+        df_resampled = df_work.resample("W-FRI").agg({
             "Open": "first",
             "High": "max",
             "Low": "min",
@@ -256,7 +267,7 @@ def process_timeframe_for_chart(
             "Volume": "sum",
         }).dropna()
     else:
-        df_resampled = df.copy()
+        df_resampled = df_work
 
     df_resampled["MA_short"] = df_resampled["Close"].rolling(window=short_ma).mean()
     df_resampled["MA_long"] = df_resampled["Close"].rolling(window=long_ma).mean()
@@ -272,6 +283,16 @@ def calculate_win_rate_for_chart(
 ) -> tuple[dict | None, pd.DataFrame | None]:
     """為圖表計算勝率 (內部使用)"""
     df_calc = df.copy()
+    
+    # 🛡️ 防禦性修正：確保索引是 DatetimeIndex，避免 get_loc 回傳 slice
+    if not isinstance(df_calc.index, pd.DatetimeIndex):
+        if "Date" in df_calc.columns:
+            df_calc = df_calc.set_index("Date")
+        df_calc.index = pd.to_datetime(df_calc.index)
+    df_calc = df_calc.sort_index()
+    # 🛡️ 移除重複日期（保留最後一筆）
+    df_calc = df_calc[~df_calc.index.duplicated(keep='last')]
+    
     cross = (
         (df_calc["MA_short"] > df_calc["MA_long"])
         & (df_calc["MA_short"].shift(1) <= df_calc["MA_long"].shift(1))
@@ -287,7 +308,11 @@ def calculate_win_rate_for_chart(
     results, trade_logs = [], []
     for date in signal_dates:
         loc = df_calc.index.get_loc(date)
-        entry_price = df_calc.loc[date, "Close"]
+        if isinstance(loc, slice):
+            loc = loc.start if loc.start is not None else 0
+        # 🛡️ 強制轉型為標量：確保 entry_price 非 Series
+        entry_price_raw = df_calc.loc[date, "Close"]
+        entry_price = float(entry_price_raw.iloc[0] if isinstance(entry_price_raw, pd.Series) else entry_price_raw)
         log_entry = {
             i18n["log_entry_date"]: date.strftime("%Y-%m-%d"),
             i18n["log_entry_price"]: round(entry_price, 2),
@@ -296,7 +321,11 @@ def calculate_win_rate_for_chart(
         for hold_days in [5, 10, 20]:
             if loc + hold_days < len(df_calc):
                 exit_date = df_calc.index[loc + hold_days]
-                future_price = df_calc["Close"].iloc[loc + hold_days]
+                future_price_raw = df_calc["Close"].iloc[loc + hold_days]
+                # 🛡️ 強制轉型為標量：確保 future_price 非 Series
+                if isinstance(future_price_raw, pd.Series):
+                    future_price_raw = future_price_raw.iloc[0]
+                future_price = float(future_price_raw)
                 ret = (future_price - entry_price) / entry_price
                 res[f"ret_{hold_days}d"] = ret
                 res[f"win_{hold_days}d"] = 1 if ret > 0 else 0

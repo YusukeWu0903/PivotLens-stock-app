@@ -12,7 +12,11 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 使用分層儲存目錄，取代單一 parquet 檔案
 CACHE_DIR = os.path.join(BASE_DIR, "market_cache")
+# 中途存檔使用臨時檔案名稱，避免與分區目錄衝突
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "market_cache_checkpoint.parquet")
 BLACKLIST_FILE = os.path.join(BASE_DIR, "blacklist.txt")
+# 興櫃股票清單（由 FinMind type=emerging 自動產生）
+EMERGING_LIST_FILE = os.path.join(BASE_DIR, "emerging_stocks.txt")
 
 # 大盤指數代碼 (FinMind API 使用的代碼)
 MARKET_INDICES = ["TAIEX", "TPEx"]
@@ -111,6 +115,16 @@ def update_market_cache():
         for idx in MARKET_INDICES:
             if idx not in all_stocks:
                 all_stocks.insert(0, idx)
+        
+        # 📌 生成興櫃股票清單 (type=emerging) 供 strategies.py 離線使用
+        try:
+            emerging_stocks = df_info[df_info['type'] == 'emerging']['stock_id'].astype(str).tolist()
+            with open(EMERGING_LIST_FILE, "w") as f:
+                for sid in emerging_stocks:
+                    f.write(f"{sid}\n")
+            print(f"✅ 已更新興櫃清單：{len(emerging_stocks)} 檔 (emerging_stocks.txt)")
+        except Exception as e:
+            print(f"⚠️ 無法寫入興櫃清單: {e}")
                 
     except Exception as e:
         print(f"\n⚠️ 無法取得股票清單: {e}")
@@ -215,8 +229,9 @@ def update_market_cache():
                     temp_df['Date'] = pd.to_datetime(temp_df['Date'])
                     temp_final = pd.concat([existing_df, temp_df], ignore_index=True) if not existing_df.empty else temp_df
                     temp_final = temp_final.drop_duplicates(subset=['Stock_ID', 'Date']).sort_values(['Stock_ID', 'Date'])
-                    # 分層儲存
-                    temp_final.to_parquet(CACHE_DIR, index=False, partition_cols=['Tier'])
+                    # 中途存檔不分區（避免 Tier 欄位尚未建立），最終存檔時再分區
+                    # 使用臨時檔案名稱，避免與分區目錄衝突
+                    temp_final.to_parquet(CHECKPOINT_FILE, index=False)
 
             if completed % 50 == 0 or completed == len(target_stocks):
                 print(f"⏳ 進度: {completed}/{len(target_stocks)}")
@@ -244,21 +259,35 @@ def update_market_cache():
         final_df = final_df.drop_duplicates(subset=['Stock_ID', 'Date']).sort_values(['Stock_ID', 'Date'])
         
         # 🚀 關鍵：為每筆資料加上 Tier 分層標籤
-        # 重新計算最新的 vol_rank 以獲得正確排名
-        if not existing_df.empty:
+        # 保留既有 Tier，只為新股票分配 Tier
+        if 'Tier' not in final_df.columns:
+            final_df['Tier'] = 'tier3_cold'
+        
+        # 找出「既有 Tier」的股票（來自 existing_df 的 Tier 欄位）
+        if not existing_df.empty and 'Tier' in existing_df.columns:
+            stocks_with_tier = existing_df[existing_df['Tier'].notna() & (existing_df['Tier'] != '')]['Stock_ID'].unique()
+        else:
+            stocks_with_tier = []
+        
+        # 只為「無 Tier 的新股票」計算 Tier
+        stocks_need_tier = final_df[~final_df['Stock_ID'].isin(stocks_with_tier)]['Stock_ID'].unique()
+        
+        if len(stocks_need_tier) > 0:
+            # 計算 vol_rank 時包含所有股票（確保排名正確）
             latest_vol_rank = final_df.groupby("Stock_ID")["Volume"].apply(lambda x: x.tail(20).mean()).to_dict()
             for idx in MARKET_INDICES:
                 latest_vol_rank[idx] = float('inf')
-            # 產生完整排序列表
+            
             all_sids = list(latest_vol_rank.keys())
             all_sids.sort(key=lambda sid: latest_vol_rank.get(sid, 0), reverse=True)
-            # 映射 Tier
             tier_map = {sid: get_tier(rank + 1) for rank, sid in enumerate(all_sids)}
-        else:
-            # 冷啟動：依 all_stocks 順序
-            tier_map = {sid: get_tier(rank + 1) for rank, sid in enumerate(all_stocks)}
+            
+            # 只更新「無 Tier 的新股票」
+            mask = final_df['Stock_ID'].isin(stocks_need_tier)
+            final_df.loc[mask, 'Tier'] = final_df.loc[mask, 'Stock_ID'].map(tier_map)
         
-        final_df['Tier'] = final_df['Stock_ID'].map(tier_map).fillna('tier3_cold')
+        # 確保所有股票都有 Tier（絕對不出現 NaN）
+        final_df['Tier'] = final_df['Tier'].fillna('tier3_cold')
         
         # 分區寫入：partition_cols=['Tier'] 會自動建立 tier1_hot/、tier2_warm/、tier3_cold/ 子目錄
         final_df.to_parquet(CACHE_DIR, index=False, partition_cols=['Tier'])

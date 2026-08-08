@@ -5,7 +5,42 @@ src/strategies.py
 純 Pandas 運算，無 Streamlit 依賴，易於單元測試。
 """
 
+import os
 import pandas as pd
+
+
+# ==========================================
+# 興櫃股票清單快取（離線讀取，零 API 成本）
+# ==========================================
+_EMERGING_STOCKS_CACHE = None
+
+
+def _load_emerging_stocks() -> set:
+    """讀取本地 emerging_stocks.txt 中的興櫃股票代號"""
+    global _EMERGING_STOCKS_CACHE
+    if _EMERGING_STOCKS_CACHE is not None:
+        return _EMERGING_STOCKS_CACHE
+    
+    file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "emerging_stocks.txt")
+    try:
+        with open(file_path, "r") as f:
+            _EMERGING_STOCKS_CACHE = set(f.read().splitlines())
+    except FileNotFoundError:
+        print("⚠️ 找不到 emerging_stocks.txt，興櫃過濾可能不精準。")
+        _EMERGING_STOCKS_CACHE = set()
+    return _EMERGING_STOCKS_CACHE
+
+
+def is_emerging_stock(stock_id: str) -> bool:
+    """
+    判斷是否為興櫃/創櫃股。
+    優先使用本地 emerging_stocks.txt 清單，檔案遺失時退回代號前綴備用邏輯。
+    """
+    emerging_set = _load_emerging_stocks()
+    if str(stock_id) in emerging_set:
+        return True
+    # 容錯備用：若清單遺失，退回最基本的防護（僅過濾 74, 75）
+    return str(stock_id).startswith(("74", "75"))
 
 
 # ==========================================
@@ -177,12 +212,8 @@ def run_market_scanner(
 
     for stock_id, df_raw in stock_dict.items():
         # 📌 興櫃與創櫃板過濾判斷
-        # 注意：Parquet 快取中目前無 Market 欄位，需透過股票代號前綴判斷
-        # 興櫃：74xx, 75xx | 創櫃：76xx, 77xx (部分) | 一般上市/上櫃：其他
-        stock_id_str = str(stock_id)
-        is_emerging = stock_id_str.startswith(("74", "75", "76", "77"))
-
-        if exclude_emerging and is_emerging:
+        # 優先使用 FinMind type=emerging 清單 (emerging_stocks.txt)，零 API 成本
+        if exclude_emerging and is_emerging_stock(str(stock_id)):
             continue
 
         lookback_bars = 350 if timeframe == "W" else 120
