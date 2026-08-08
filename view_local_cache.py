@@ -40,6 +40,8 @@ def load_cache_data():
     try:
         df = pd.read_parquet(CACHE_DIR)
         df['Date'] = pd.to_datetime(df['Date'])
+        # 🛡️ 修正：強制將 Stock_ID 轉為字串，解決型態不匹配問題
+        df['Stock_ID'] = df['Stock_ID'].astype(str)
         return df
     except Exception as e:
         st.error(f"❌ 無法讀取快取: {e}")
@@ -58,6 +60,26 @@ def load_stock_names():
     return {}
 
 # ==========================================
+# 快取摘要計算 (移除 @st.cache_data，確保即時更新)
+# ==========================================
+def get_stock_summary(df):
+    """計算股票摘要清單 - 不使用快取，確保即時更新"""
+    summary_list = []
+    for stock_id, group in df.groupby('Stock_ID'):
+        name = stock_names.get(str(stock_id), "未知公司")
+        latest = group.sort_values('Date').iloc[-1]
+        summary_list.append({
+            "股票代號": stock_id,
+            "股票名稱": name,
+            "Tier": group['Tier'].iloc[0],
+            "最新日期": latest['Date'].strftime('%Y-%m-%d'),
+            "最新收盤價": round(latest['Close'], 2),
+            "最新成交量(張)": int(latest['Volume'] // 1000),
+            "資料筆數": len(group),
+        })
+    return pd.DataFrame(summary_list)
+
+# ==========================================
 # 載入資料
 # ==========================================
 df = load_cache_data()
@@ -71,6 +93,11 @@ if df is None:
 # 側邊欄：搜尋與過濾器
 # ==========================================
 st.sidebar.header("🔎 搜尋與過濾")
+
+# 🔄 清除快取按鈕
+if st.sidebar.button("🔄 重新整理 / 清除快取"):
+    st.cache_data.clear()
+    st.rerun()
 
 # Tier 過濾
 tier_options = ["全部"] + sorted(df['Tier'].unique().tolist())
@@ -89,9 +116,9 @@ if selected_tier != "全部":
 
 if search_keyword:
     # 代號搜尋
-    code_match = filtered_df['Stock_ID'].astype(str).str.contains(search_keyword, case=False, na=False)
+    code_match = filtered_df['Stock_ID'].str.contains(search_keyword, case=False, na=False)
     # 名稱搜尋
-    name_match = filtered_df['Stock_ID'].astype(str).map(
+    name_match = filtered_df['Stock_ID'].map(
         lambda x: search_keyword.lower() in stock_names.get(x, "").lower()
     ).fillna(False)
     filtered_df = filtered_df[code_match | name_match]
@@ -135,24 +162,7 @@ st.divider()
 # ==========================================
 st.subheader(f"📋 股票清單總覽 (共 {len(filtered_df):,} 筆 / {filtered_df['Stock_ID'].nunique()} 檔)")
 
-# 建立摘要清單
-@st.cache_data
-def get_stock_summary(_df):
-    summary_list = []
-    for stock_id, group in _df.groupby('Stock_ID'):
-        name = stock_names.get(str(stock_id), "未知公司")
-        latest = group.sort_values('Date').iloc[-1]
-        summary_list.append({
-            "股票代號": stock_id,
-            "股票名稱": name,
-            "Tier": group['Tier'].iloc[0],
-            "最新日期": latest['Date'].strftime('%Y-%m-%d'),
-            "最新收盤價": round(latest['Close'], 2),
-            "最新成交量(張)": int(latest['Volume'] // 1000),
-            "資料筆數": len(group),
-        })
-    return pd.DataFrame(summary_list)
-
+# 計算摘要清單 (不使用快取，確保即時更新)
 df_summary = get_stock_summary(filtered_df)
 
 # 顯示清單
