@@ -10,6 +10,7 @@ venv/
 # 本地下載的全市場數據檔 (避免檔案太龐大上傳失敗)
 *.pickle
 *.csv
+check_stock_diff.py
 market_cache/
 
 # 個人隱私設定或 API 金鑰

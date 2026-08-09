@@ -8,10 +8,9 @@ import streamlit as st
 import pandas as pd
 
 # 專案模組
-from src.config_manager import get_strategy_config, get_strategy_names
+from src.config_manager import get_strategy_config, get_strategy_names, I18N, get_stock_name_map
 from src.strategies import run_market_scanner
 from src.charts import render_kline_chart
-from config import I18N, get_stock_name_map
 
 
 # ==========================================
@@ -72,11 +71,11 @@ def get_stock_name(stock_id):
 # ==========================================
 @st.cache_data
 def run_scanner_cached(
-    _stock_dict, strategy_name, entry_pattern, min_volume_sheets, price_range, exclude_emerging, new_tag_days
+    stock_dict, strategy_name, entry_pattern, min_volume_sheets, price_range, exclude_emerging, new_tag_days
 ):
     """包裝 run_market_scanner 以便套用 @st.cache_data"""
     return run_market_scanner(
-        _stock_dict,
+        stock_dict,
         strategy_name,
         entry_pattern,
         min_volume_sheets,
