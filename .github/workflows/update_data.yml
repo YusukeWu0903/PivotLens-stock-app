@@ -1,0 +1,48 @@
+name: Auto Update Market Data
+
+on:
+  schedule:
+    # 台灣時間 (CST) 每天下午 16:30 執行 (UTC 時間 08:30)
+    - cron: '30 8 * * 1-5'
+  # 允許你在 GitHub 網頁上手動點擊按鈕觸發
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 📥 簽出程式碼 (Checkout repository)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🐍 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 安裝依賴套件
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 🚀 執行市場資料更新
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          python update_market_data.py
+
+      - name: 💾 提交更新 (含災難復原暫存檔)
+        if: always()
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          git add market_cache/ market_cache_checkpoint.parquet emerging_stocks.txt blacklist.txt stock_names.json || true
+
+          git diff --quiet && git diff --staged --quiet || (git commit -m "auto: 每日定時更新市場快取 $(date +%F) [skip ci]" && git push)
