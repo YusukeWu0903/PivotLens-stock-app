@@ -11,7 +11,6 @@ venv/
 *.pickle
 *.csv
 check_stock_diff.py
-market_cache/
 
 # 個人隱私設定或 API 金鑰
 .env
