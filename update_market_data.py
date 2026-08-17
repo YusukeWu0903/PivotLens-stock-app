@@ -31,7 +31,7 @@ MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "552"))
 # 中途存檔間隔 (ARCHITECTURE 1.2：每 110 筆)
 CHECKPOINT_INTERVAL = int(os.getenv("UPDATE_CHECKPOINT_INTERVAL", "110"))
 # 請求間隔（秒）
-REQUEST_DELAY = float(os.getenv("UPDATE_REQUEST_DELAY", "0.3"))
+REQUEST_DELAY = float(os.getenv("UPDATE_REQUEST_DELAY", "1.0"))
 
 
 def fetch_single_stock_daily(dl: DataLoader, stock_id: str, start_date: str, end_date: str) -> pd.DataFrame | None:

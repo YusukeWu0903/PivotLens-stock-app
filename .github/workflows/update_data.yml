@@ -2,10 +2,16 @@ name: Auto Update Market Data
 
 on:
   schedule:
-    # 台灣時間 (CST) 每天下午 16:30 執行 (UTC 時間 08:30)
-    - cron: '30 8 * * 1-5'
-  # 允許你在 GitHub 網頁上手動點擊按鈕觸發
-  workflow_dispatch:
+    # 1. 台灣時間 15:30 (UTC 07:30) -> 第 1 批 (1 ~ 552 檔)
+    - cron: '30 7 * * 1-5'
+    # 2. 台灣時間 17:30 (UTC 09:30) -> 第 2 批 (553 ~ 1104 檔)
+    - cron: '30 9 * * 1-5'
+    # 3. 台灣時間 19:30 (UTC 11:30) -> 第 3 批 (1105 ~ 1656 檔)
+    - cron: '30 11 * * 1-5'
+    # 4. 台灣時間 21:30 (UTC 13:30) -> 第 4 批 (保險補漏，確保 100% 覆蓋)
+    - cron: '30 13 * * 1-5'
+
+  workflow_dispatch: # 保留手動按鈕
 
 permissions:
   contents: write
