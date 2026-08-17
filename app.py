@@ -90,6 +90,14 @@ def run_scanner_cached(
 # ==========================================
 st.sidebar.header("🎯 策略選擇")
 
+# 1. 新增交易方向選擇（多/空）
+trade_direction = st.sidebar.radio(
+    "交易方向",
+    options=["做多 (金叉買進)", "做空 (死叉賣出)"],
+    index=0,
+    horizontal=True
+)
+
 strategy_names = get_strategy_names()
 strategy_name = st.sidebar.selectbox(
     "選擇選股模式",
@@ -111,13 +119,22 @@ price_range = st.sidebar.selectbox(
     index=0,
 )
 
-entry_pattern = st.sidebar.selectbox(
-    "買點型態",
-    options=["貼近均線 (強效支撐)", "適度回測 (標準進場)", "允許追高 (強勢動能)"],
-    index=0,
-    help="貼近均線代表股價剛拉回長均線支撐附近，進場風險最低。",
-)
+# 2. 依據交易方向動態調整「進場型態」的選項與說明
+if "做多" in trade_direction:
+    pattern_label = "進場/買點型態"
+    pattern_options = ["貼近均線 (強效支撐)", "適度回測 (標準進場)", "允許追高 (強勢動能)"]
+    pattern_help = "貼近均線代表股價剛拉回長均線支撐附近，進場風險最低。"
+else:
+    pattern_label = "放空/賣點型態"
+    pattern_options = ["貼近均線 (強效壓力)", "適度反彈 (標準放空)", "允許追低 (弱勢動能)"]
+    pattern_help = "貼近均線代表股價剛反彈至長均線壓力附近，放空風險最低。"
 
+entry_pattern = st.sidebar.selectbox(
+    pattern_label,
+    options=pattern_options,
+    index=0,
+    help=pattern_help,
+)
 
 # ==========================================
 # 執行掃描
