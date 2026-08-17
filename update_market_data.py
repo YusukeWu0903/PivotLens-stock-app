@@ -314,43 +314,27 @@ def update_market_cache():
         final_df = final_df.drop_duplicates(subset=['Stock_ID', 'Date'], keep='last').sort_values(['Stock_ID', 'Date'])
         final_df = _normalize_stock_id(final_df)
 
+        # ==========================================
         # 🚀 關鍵 (ARCHITECTURE 1.1)：為每筆資料加上 Tier 分層標籤
-        # 既有股票的 Tier 絕對鎖死，只為「新抓取、無 Tier」的股票分配 Tier
-        if 'Tier' not in existing_df.columns:
-            # 冷啟動：所有股票皆為新
-            existing_tier_map = {}
-        else:
-            existing_tier_map = existing_df.drop_duplicates(subset=['Stock_ID'], keep='last').set_index('Stock_ID')['Tier'].to_dict()
+        # 【徹底解鎖版】每次存檔強制對「所有已抓取股票」重新計算均量排名，保證數量精準不膨脹！
+        # ==========================================
+        
+        # 1. 計算當前資料庫中「所有股票」的近 20 日平均成交量
+        latest_vol_rank = final_df.groupby("Stock_ID")["Volume"].apply(lambda x: x.tail(20).mean()).to_dict()
+        
+        # 2. 🏆 VIP 霸王條款：確保大盤指數永遠排第一、第二
+        for idx in MARKET_INDICES:
+            latest_vol_rank[idx] = float('inf')
 
-        # 🛡️ 破除 Categorical 限制：將 Tier 強制轉為字串
-        if 'Tier' in final_df.columns:
-            final_df['Tier'] = final_df['Tier'].astype(str)
-            final_df['Tier'] = final_df['Tier'].replace(['nan', 'None', '<NA>', ''], pd.NA)
-        else:
-            final_df['Tier'] = pd.NA
+        # 3. 將所有股票依照均量由大到小排序
+        all_sids = list(latest_vol_rank.keys())
+        all_sids.sort(key=lambda sid: latest_vol_rank.get(sid, 0), reverse=True)
+        
+        # 4. 依照絕對排名分配 Tier (1~552: tier1_hot | 553~1102: tier2_warm | 其餘: tier3_cold)
+        tier_map = {sid: get_tier(rank + 1) for rank, sid in enumerate(all_sids)}
 
-        # 對既有股票套用鎖死的 Tier
-        final_df['Tier'] = final_df['Stock_ID'].map(existing_tier_map).fillna(pd.NA)
-
-        # 找出「沒有 Tier (新股票)」的股票
-        stocks_need_tier = final_df[final_df['Tier'].isna()]['Stock_ID'].unique()
-
-        if len(stocks_need_tier) > 0:
-            # 計算 vol_rank 時包含所有股票（確保新股票排名正確）
-            latest_vol_rank = final_df.groupby("Stock_ID")["Volume"].apply(lambda x: x.tail(20).mean()).to_dict()
-            for idx in MARKET_INDICES:
-                latest_vol_rank[idx] = float('inf')
-
-            all_sids = list(latest_vol_rank.keys())
-            all_sids.sort(key=lambda sid: latest_vol_rank.get(sid, 0), reverse=True)
-            tier_map = {sid: get_tier(rank + 1) for rank, sid in enumerate(all_sids)}
-
-            # 只為「無 Tier 的新股票」分配 Tier (既有股票維持鎖死)
-            mask = final_df['Stock_ID'].isin(stocks_need_tier)
-            final_df.loc[mask, 'Tier'] = final_df.loc[mask, 'Stock_ID'].map(tier_map)
-
-        # 確保所有股票都有 Tier（絕對不出現 NaN/空值）
-        final_df['Tier'] = final_df['Tier'].fillna('tier3_cold').astype(str)
+        # 5. 無視舊有 Tier，強制將重新計算的精準 Tier 覆寫上去
+        final_df['Tier'] = final_df['Stock_ID'].map(tier_map).fillna('tier3_cold').astype(str)
 
         # ARCHITECTURE 1.1：寫入前先清空舊分區目錄，防止 Parquet 碎片檔案無限增生與 Git 空間膨脹
         if os.path.exists(CACHE_DIR):
