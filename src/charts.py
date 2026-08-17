@@ -80,8 +80,7 @@ def render_kline_chart(
     # ========== 歷史交易明細展開區 ==========
     if trade_logs_df is not None and not trade_logs_df.empty:
         with st.expander(i18n["expander_logs"]):
-            st.dataframe(trade_logs_df, width="stretch")
-
+            st.dataframe(trade_logs_df, use_container_width=True)
     st.divider()
 
     # ========== K 線圖繪製 ==========
