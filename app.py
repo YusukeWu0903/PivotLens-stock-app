@@ -90,15 +90,17 @@ def run_scanner_cached(
 # ==========================================
 st.sidebar.header("🎯 策略選擇")
 
-# 1. 新增交易方向選擇（多/空）
+# 1. 交易方向單選按鈕
 trade_direction = st.sidebar.radio(
     "交易方向",
     options=["做多 (金叉買進)", "做空 (死叉賣出)"],
     index=0,
-    horizontal=True
+    horizontal=True,
 )
+is_short = "做空" in trade_direction
 
-strategy_names = get_strategy_names()
+# 2. 依據多空方向動態載入策略名稱
+strategy_names = get_strategy_names(is_short=is_short)
 strategy_name = st.sidebar.selectbox(
     "選擇選股模式",
     options=strategy_names,
@@ -119,15 +121,15 @@ price_range = st.sidebar.selectbox(
     index=0,
 )
 
-# 2. 依據交易方向動態調整「進場型態」的選項與說明
-if "做多" in trade_direction:
-    pattern_label = "進場/買點型態"
-    pattern_options = ["貼近均線 (強效支撐)", "適度回測 (標準進場)", "允許追高 (強勢動能)"]
-    pattern_help = "貼近均線代表股價剛拉回長均線支撐附近，進場風險最低。"
+# 3. 依多空調整進場型態的文案
+if not is_short:
+    pattern_label = "買點型態 (雙引擎切換)"
+    pattern_options = ["貼近均線 (量縮防守)", "適度回測 (量縮洗盤)", "強勢創高 (帶量突破)"]
+    pattern_help = "【潛伏回檔引擎】貼近均線/回測：要求今日量縮，且收盤價死守長均線防線。\n【動能追擊引擎】強勢創高：無視乖離率，要求帶量發動，且逼近近20日最高點。"
 else:
-    pattern_label = "放空/賣點型態"
-    pattern_options = ["貼近均線 (強效壓力)", "適度反彈 (標準放空)", "允許追低 (弱勢動能)"]
-    pattern_help = "貼近均線代表股價剛反彈至長均線壓力附近，放空風險最低。"
+    pattern_label = "賣點/放空型態 (雙引擎切換)"
+    pattern_options = ["貼近均線 (量縮遇壓)", "適度反彈 (量縮測壓)", "弱勢破底 (帶量下殺)"]
+    pattern_help = "【潛伏反彈引擎】貼近均線/反彈：要求今日量縮，且收盤價受制於長均線反壓。\n【弱勢追殺引擎】弱勢破底：無視乖離率，要求帶量下殺，且逼近近20日最低點。"
 
 entry_pattern = st.sidebar.selectbox(
     pattern_label,
@@ -165,14 +167,15 @@ if scan_df is not None and not scan_df.empty:
     tf_unit = "周" if cfg["timeframe"] == "W" else "日"
 
     st.subheader(f"📊 掃描結果：{strategy_name}")
-    st.info("💡 **篩選邏輯說明**："
+    st.info("💡 **雙引擎量價策略與洗盤防禦說明**："
             "" + chr(10) + chr(10) + ""
-            "* **核心策略**：" + cfg['desc'] + ""
+            "* **核心邏輯**：" + cfg['desc'] + ""
             "" + chr(10) + chr(10) + ""
-            "* **過濾條件**：市場別：**" + market_text + "** | 20 日均量 " + vol_text + " | 股價 " + price_text + " | "
-            "近 **" + str(curr_n_days) + "** 根 " + tf_unit + "K 棒內交叉 | 買點位置：**" + entry_pattern + "**"
+            "* 🛡️ **潛伏引擎 (貼近均線/回測)**：買在主力防守點。要求 **量縮洗盤 (今日量 ≤ 均量 1.5 倍)**，且 **收盤價死守均線防線 (容錯 1%)**，剔除爆量貫破支撐的接刀股。"
             "" + chr(10) + chr(10) + ""
-            "* **自動洗盤防禦**：排除近 20 根 K 棒交叉 3 次以上之均線糾結橫盤股。")
+            "* 🚀 **動能引擎 (強勢創高/弱勢破底)**：追擊主升/主跌段。解除乖離率上限，要求 **帶量發動 (今日量 ≥ 均量 0.8 倍)**，且 **收盤價逼近近 20 日極端點 (3% 內)**，剔除無量假突破。"
+            "" + chr(10) + chr(10) + ""
+            "* 🚦 **過濾條件**：20 日均量 " + vol_text + " | 股價 " + price_text + " | 排除 20 日內頻繁交叉 3 次以上之均線糾結橫盤股。")
 
     new_count = scan_df["Is_New"].sum()
     st.caption(

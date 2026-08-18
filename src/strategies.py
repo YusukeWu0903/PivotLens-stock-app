@@ -44,13 +44,19 @@ def is_emerging_stock(stock_id: str) -> bool:
 
 
 # ==========================================
-# 常數定義
+# 買點/賣點型態區間映射：(min_thresh, max_thresh) 互斥區間
+# 💡 當 max_thresh >= 0.10 時，系統將自動啟動「引擎二：動能追擊」
 # ==========================================
-# 買點型態區間映射：(min_thresh, max_thresh) 互斥區間
 PATTERN_THRESHOLD_MAP = {
-    "貼近均線 (強效支撐)": (0.00, 0.03),
-    "適度回測 (標準進場)": (0.03, 0.05),
-    "允許追高 (強勢動能)": (0.05, 0.08),
+    # 📈 多方選項
+    "貼近均線 (量縮防守)": (0.00, 0.03),     # 引擎一
+    "適度回測 (量縮洗盤)": (0.03, 0.08),     # 引擎一 (容忍稍微深一點的回測)
+    "強勢創高 (帶量突破)": (0.10, 99.0),     # 引擎二 (解鎖乖離率上限)
+    
+    # 📉 空方選項
+    "貼近均線 (量縮遇壓)": (0.00, 0.03),     # 引擎一
+    "適度反彈 (量縮測壓)": (0.03, 0.08),     # 引擎一
+    "弱勢破底 (帶量下殺)": (0.10, 99.0),     # 引擎二 (解鎖乖離率上限)
 }
 
 
@@ -180,6 +186,7 @@ def run_market_scanner(
     exclude_emerging: bool = True,
     new_tag_days: int = 3,
     strategy_config: dict | None = None,
+    min_vol: int = 0,  # 👈 新增這個參數，預設給 0
 ) -> pd.DataFrame:
     """
     全市場掃描主邏輯 (純運算版，無 Streamlit 依賴)
@@ -252,24 +259,75 @@ def run_market_scanner(
 
         current_ma_long = df["MA_long"].iloc[-1]
         ma_long_prev = df["MA_long"].iloc[-4] if len(df) >= 4 else current_ma_long
-        is_long_ma_up = current_ma_long > ma_long_prev
 
         # 🛡️ 防禦性檢查：若 MA_long 為 NaN 或 0 (資料不足/異常) 則跳過
         if pd.isna(current_ma_long) or current_ma_long == 0:
             continue
 
-        recent_golden = golden_cross.tail(n_days).any()
-        ma_bullish = df["MA_short"].iloc[-1] > df["MA_long"].iloc[-1]
-        
-        # 📌 區間互斥邏輯：根據買點型態決定價格距離區間
-        dist = abs(df["Close"].iloc[-1] - current_ma_long) / current_ma_long
-        if min_thresh == 0.0:
-            price_near = dist <= max_thresh
+        # 📌 取得最新收盤價與量能數據
+        close_price = df["Close"].iloc[-1]
+        current_vol = df["Volume"].iloc[-1]  # 今日成交量
+        vol_ma20 = df["Volume"].rolling(20).mean().iloc[-1] # 20日均量
+
+        # 🌟 基礎過濾：剔除流動性過低的殭屍股 (假設 UI 傳入 min_vol = 1000)
+        if vol_ma20 < min_volume_sheets:
+            continue
+
+        is_short_strategy = "空" in strategy_name or "死" in strategy_name
+
+        if not is_short_strategy:
+            # ==========================================
+            # 📈 買進做多邏輯 (金叉 + 多頭 + 趨勢向上)
+            # ==========================================
+            recent_cross_signal = golden_cross.tail(n_days).any()
+            ma_alignment = df["MA_short"].iloc[-1] > df["MA_long"].iloc[-1]
+            ma_trend = current_ma_long > ma_long_prev
+            
+            bias_rate = (close_price - current_ma_long) / current_ma_long
+            support_holds = bias_rate >= -0.01
+
+            if max_thresh < 0.10: 
+                # 【核心一：潛伏回檔】
+                price_match = (bias_rate >= min_thresh) and (bias_rate <= max_thresh)
+                # 🌟 量能濾網：量縮回測 (今日量不可異常放大，最多不超過均量的 1.5 倍)
+                volume_match = current_vol <= (vol_ma20 * 1.5)
+            else:
+                # 【核心二：動能追擊】
+                recent_high = df["High"].tail(20).max()
+                price_match = (close_price >= recent_high * 0.97)
+                # 🌟 量能濾網：帶量突破 (今日量必須充足，至少有均量的 80% 水準)
+                volume_match = current_vol >= (vol_ma20 * 0.8)
+
+            is_pattern_valid = support_holds and price_match and volume_match
+
         else:
-            price_near = (dist > min_thresh) and (dist <= max_thresh)
+            # ==========================================
+            # 📉 放空做空邏輯 (死叉 + 空頭 + 趨勢向下)
+            # ==========================================
+            recent_cross_signal = death_cross.tail(n_days).any()
+            ma_alignment = df["MA_short"].iloc[-1] < df["MA_long"].iloc[-1]
+            ma_trend = current_ma_long < ma_long_prev
+            
+            bias_rate = (current_ma_long - close_price) / current_ma_long
+            resistance_holds = bias_rate >= -0.01
 
-        is_selected = recent_golden and ma_bullish and price_near and is_long_ma_up
+            if max_thresh < 0.10:
+                # 【核心一：潛伏反彈】
+                price_match = (bias_rate >= min_thresh) and (bias_rate <= max_thresh)
+                # 🌟 量能濾網：無量反彈 (反彈過程量能萎縮，代表買盤無力)
+                volume_match = current_vol <= (vol_ma20 * 1.5)
+            else:
+                # 【核心二：弱勢追殺】
+                recent_low = df["Low"].tail(20).min()
+                price_match = (close_price <= recent_low * 1.03)
+                # 🌟 量能濾網：帶量下殺 (恐慌性賣壓湧現)
+                volume_match = current_vol >= (vol_ma20 * 0.8)
 
+            is_pattern_valid = resistance_holds and price_match and volume_match
+
+        # 🎯 最終匯總
+        is_selected = recent_cross_signal and ma_alignment and ma_trend and is_pattern_valid
+        
         if is_selected:
             golden_indices = df[golden_cross].index
             is_new_signal = False

@@ -15,9 +15,10 @@ import json
 import os
 
 # ==========================================
-# 策略設定字典 (未來可移至外部配置檔)
+# 策略設定字典 (包含多方與空方策略)
 # ==========================================
 STRATEGY_CONFIG = {
+    # 📈 多方策略
     "短多 (日K 5MA + 20MA)": {
         "timeframe": "D",
         "short_ma": 5,
@@ -39,6 +40,28 @@ STRATEGY_CONFIG = {
         "n_days": 20,
         "desc": "適合大趨勢保護：抓取周線 13MA 近 20 周黃金交叉 52MA（一年）之長線趨勢發動股。",
     },
+    # 📉 空方策略
+    "短空 (日K 5MA + 20MA)": {
+        "timeframe": "D",
+        "short_ma": 5,
+        "long_ma": 20,
+        "n_days": 5,
+        "desc": "適合短線避險/做空：抓取日線 5MA 近 5 日死亡交叉 20MA 且股價反彈至月線反壓附近之標的。",
+    },
+    "中空 (日K 20MA + 60MA)": {
+        "timeframe": "D",
+        "short_ma": 20,
+        "long_ma": 60,
+        "n_days": 10,
+        "desc": "適合波段避險/做空：抓取日線 20MA 近 10 日死亡交叉 60MA（季線）且月線斜率向下之標的。",
+    },
+    "長空 (周K 13MA + 52MA)": {
+        "timeframe": "W",
+        "short_ma": 13,
+        "long_ma": 52,
+        "n_days": 20,
+        "desc": "適合大趨勢避險：抓取周線 13MA 近 20 周死亡交叉 52MA（一年）之長線空頭確認股。",
+    },
 }
 
 
@@ -57,9 +80,10 @@ def get_strategy_config(strategy_name: str | None = None) -> dict:
     return STRATEGY_CONFIG.get(strategy_name, {})
 
 
-def get_strategy_names() -> list[str]:
-    """取得所有策略名稱列表"""
-    return list(STRATEGY_CONFIG.keys())
+def get_strategy_names(is_short: bool = False) -> list[str]:
+    """取得策略名稱列表，可依據做多/做空過濾"""
+    keyword = "空" if is_short else "多"
+    return [name for name in STRATEGY_CONFIG.keys() if keyword in name]
 
 
 def validate_strategy_params(params: dict) -> bool:
