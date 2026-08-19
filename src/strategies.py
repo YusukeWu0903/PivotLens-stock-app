@@ -235,27 +235,62 @@ def run_market_scanner(
         current_vol = df["Volume"].iloc[-1]
         vol_ma20 = df["Volume"].rolling(20).mean().iloc[-1]
 
-        # 📌 預先計算雙引擎所需的所有布林/數值指標 (不過濾，全保留)
+        # 📌 計算每一根 K 棒距離最新資料日期的真實日曆天數 (解決周K會抓到20周的問題)
+        days_diff = (df.index[-1] - df.index).days
+
+        # ==========================================
+        # 📈 雙引擎指標計算
+        # ==========================================
         if not is_short_strategy:
-            recent_cross_signal = golden_cross.tail(n_days).any()
+            # 只要交叉發生在距離今天 n_days (例如 20 天) 以內，即算有效訊號
+            recent_cross_signal = (golden_cross & (days_diff <= n_days)).any()
             ma_alignment = df["MA_short"].iloc[-1] > df["MA_long"].iloc[-1]
             ma_trend = current_ma_long > ma_long_prev
             
             bias_rate = (close_price - current_ma_long) / current_ma_long
-            support_holds = bias_rate >= -0.01
+            support_holds = bias_rate >= -0.01  # 支撐不破
             
-            recent_high = df["High"].tail(20).max()
-            momentum_breakout = (close_price >= recent_high * 0.97)
+            # 1. 抓取「昨天以前」近 20 日的最高價 (排除今天)
+            prev_high_20 = df["High"].iloc[:-1].tail(20).max()
+            
+            # 2. 實質突破：今日收盤價必須「大於等於」前 20 日最高價 (無折扣)
+            is_real_breakout = close_price >= prev_high_20
+            
+            # 3. K 棒實體強度：收盤價需位於今日高低振幅的上半部 60% 以上 (避免長上影線)
+            day_range = df["High"].iloc[-1] - df["Low"].iloc[-1]
+            is_strong_close = (close_price - df["Low"].iloc[-1]) >= (day_range * 0.6) if day_range > 0 else True
+            
+            momentum_breakout = is_real_breakout and is_strong_close
+            
+            # 4. 帶量判定：今日成交量需大於 20 日均量的 1.2 倍
+            vol_surge = current_vol >= (vol_ma20 * 1.2)
+            vol_shrink = current_vol <= (vol_ma20 * 1.5)
+
         else:
-            recent_cross_signal = death_cross.tail(n_days).any()
+            # ==========================================
+            # 📉 做空破底邏輯
+            # ==========================================
+            recent_cross_signal = (death_cross & (days_diff <= n_days)).any()
             ma_alignment = df["MA_short"].iloc[-1] < df["MA_long"].iloc[-1]
             ma_trend = current_ma_long < ma_long_prev
             
             bias_rate = (current_ma_long - close_price) / current_ma_long
-            support_holds = bias_rate >= -0.01
+            support_holds = bias_rate >= -0.01  # 壓力不破
             
-            recent_low = df["Low"].tail(20).min()
-            momentum_breakout = (close_price <= recent_low * 1.03)
+            # 抓取「昨天以前」近 20 日的最低價
+            prev_low_20 = df["Low"].iloc[:-1].tail(20).min()
+            
+            # 實質跌破：收盤價小於等於前 20 日最低價
+            is_real_breakdown = close_price <= prev_low_20
+            
+            # K 棒收在低點附近 (收在振幅下半部 40% 以下)
+            day_range = df["High"].iloc[-1] - df["Low"].iloc[-1]
+            is_weak_close = (close_price - df["Low"].iloc[-1]) <= (day_range * 0.4) if day_range > 0 else True
+            
+            momentum_breakout = is_real_breakdown and is_weak_close
+            
+            vol_surge = current_vol >= (vol_ma20 * 1.2)
+            vol_shrink = current_vol <= (vol_ma20 * 1.5)
 
         # 基礎門檻：連訊號或趨勢都沒有的，直接淘汰以省記憶體
         if not (recent_cross_signal and ma_alignment and ma_trend):

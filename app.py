@@ -114,15 +114,15 @@ price_range = st.sidebar.selectbox(
     index=0,
 )
 
-# 3. 依多空調整進場型態的文案
+# 3. 依多空調整進場型態文案 (純粹二選一雙引擎)
 if not is_short:
-    pattern_label = "買點型態 (雙引擎切換)"
-    pattern_options = ["貼近均線 (量縮防守)", "適度回測 (量縮洗盤)", "強勢創高 (帶量突破)"]
-    pattern_help = "【潛伏回檔引擎】貼近均線/回測：要求今日量縮，且收盤價死守長均線防線。\n【動能追擊引擎】強勢創高：無視乖離率，要求帶量發動，且逼近近20日最高點。"
+    pattern_label = "買點型態"
+    pattern_options = ["拉回支撐 (量縮潛伏)", "強勢創高 (帶量突破)"]
+    pattern_help = "【拉回支撐】買在主力防守點：要求今日量縮，且股價回測長均線 (0~8%) 守穩不破。\n【強勢創高】追擊主升段：要求帶量實質過前高 (20日最高)，且尾盤強勢收高。"
 else:
-    pattern_label = "賣點/放空型態 (雙引擎切換)"
-    pattern_options = ["貼近均線 (量縮遇壓)", "適度反彈 (量縮測壓)", "弱勢破底 (帶量下殺)"]
-    pattern_help = "【潛伏反彈引擎】貼近均線/反彈：要求今日量縮，且收盤價受制於長均線反壓。\n【弱勢追殺引擎】弱勢破底：無視乖離率，要求帶量下殺，且逼近近20日最低點。"
+    pattern_label = "賣點/放空型態"
+    pattern_options = ["反彈遇壓 (量縮潛伏)", "弱勢破底 (帶量下殺)"]
+    pattern_help = "【反彈遇壓】空在壓力防守點：要求今日量縮，且股價反彈至長均線 (0~8%) 受阻不破。\n【弱勢破底】追擊主跌段：要求帶量實質破前低 (20日最低)，且尾盤弱勢收低。"
 
 entry_pattern = st.sidebar.selectbox(
     pattern_label,
@@ -153,23 +153,21 @@ if raw_scan_df is not None and not raw_scan_df.empty:
     if exclude_emerging:
         df_filtered = df_filtered[~df_filtered["Is_Emerging"]]
 
-    # 3. 雙引擎型態動態過濾
+    # 3. 雙引擎型態動態過濾 (二選一極簡邏輯)
     if "強勢創高" in entry_pattern or "弱勢破底" in entry_pattern:
-        # 🚀 引擎二：動能追擊
+        # 🚀 引擎二：動能追擊 (實質過前高/前低 + 收高/收低 + 出量)
         df_filtered = df_filtered[
             df_filtered["Support_Holds"] & 
             df_filtered["Momentum_Breakout"] & 
             df_filtered["Vol_Surge"]
         ]
     else:
-        # 🛡️ 引擎一：潛伏回檔
-        min_thresh = 0.00 if "貼近均線" in entry_pattern else 0.03
-        max_thresh = 0.03 if "貼近均線" in entry_pattern else 0.08
+        # 🛡️ 引擎一：拉回支撐 / 反彈遇壓 (統一 0% ~ 8% 區間 + 守穩 + 量縮)
         df_filtered = df_filtered[
             df_filtered["Support_Holds"] & 
             df_filtered["Vol_Shrink"] & 
-            (df_filtered["Bias_Rate"] >= min_thresh) & 
-            (df_filtered["Bias_Rate"] <= max_thresh)
+            (df_filtered["Bias_Rate"] >= 0.00) & 
+            (df_filtered["Bias_Rate"] <= 0.08)
         ]
 
     scan_df = df_filtered
@@ -195,11 +193,11 @@ if scan_df is not None and not scan_df.empty:
             "" + chr(10) + chr(10) + ""
             "* **核心邏輯**：" + cfg['desc'] + ""
             "" + chr(10) + chr(10) + ""
-            "* 🛡️ **潛伏引擎 (貼近均線/回測)**：買在主力防守點。要求 **量縮洗盤 (今日量 ≤ 均量 1.5 倍)**，且 **收盤價死守均線防線 (容錯 1%)**，剔除爆量貫破支撐的接刀股。"
+            "* **潛伏引擎 (拉回支撐 / 反彈遇壓)**：買在主力防守點。**量縮洗盤**，**股價回測均線 0~8% 內且守穩**，剔除爆量貫破支撐的接刀股。"
             "" + chr(10) + chr(10) + ""
-            "* 🚀 **動能引擎 (強勢創高/弱勢破底)**：追擊主升/主跌段。解除乖離率上限，要求 **帶量發動 (今日量 ≥ 均量 0.8 倍)**，且 **收盤價逼近近 20 日極端點 (3% 內)**，剔除無量假突破。"
+            "* **動能引擎 (強勢創高 / 弱勢破底)**：追擊主升/主跌段。**突破過往 20 日高低點** + **K棒強勢收高/收低** + **帶量發動**，剔除假創高與高檔甩轎盤。"
             "" + chr(10) + chr(10) + ""
-            "* 🚦 **過濾條件**：20 日均量 " + vol_text + " | 股價 " + price_text + " | 排除 20 日內頻繁交叉 3 次以上之均線糾結橫盤股。")
+            "* **過濾條件**：20 日均量 " + vol_text + " | 股價 " + price_text + " | 排除 20 日內頻繁交叉 3 次以上之均線糾結橫盤股。")
 
     new_count = scan_df["Is_New"].sum()
     st.caption(
