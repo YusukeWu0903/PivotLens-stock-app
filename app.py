@@ -70,18 +70,11 @@ def get_stock_name(stock_id):
 # 掃描器包裝函式 (帶快取)
 # ==========================================
 @st.cache_data
-def run_scanner_cached(
-    stock_dict, strategy_name, entry_pattern, min_volume_sheets, price_range, exclude_emerging, new_tag_days
-):
-    """包裝 run_market_scanner 以便套用 @st.cache_data"""
+def run_scanner_cached(_stock_dict, strategy_name):  # 👈 在 stock_dict 前加上底線
+    """只快取「基礎大掃描」的結果，與 UI 條件脫鉤"""
     return run_market_scanner(
-        stock_dict,
-        strategy_name,
-        entry_pattern,
-        min_volume_sheets,
-        price_range,
-        exclude_emerging,
-        new_tag_days,
+        stock_dict=_stock_dict,
+        strategy_name=strategy_name
     )
 
 
@@ -139,18 +132,49 @@ entry_pattern = st.sidebar.selectbox(
 )
 
 # ==========================================
-# 執行掃描
+# 執行掃描與極速記憶體過濾
 # ==========================================
-with st.spinner(f"正在以【{strategy_name}】模式掃描全台股..."):
-    scan_df = run_scanner_cached(
-        stock_dict,
-        strategy_name,
-        entry_pattern,
-        min_vol,
-        price_range,
-        exclude_emerging,
-        new_tag_days=3,
-    )
+with st.spinner(f"正在計算【{strategy_name}】全市場指標 (每日初次或切換策略時較久)..."):
+    # 這裡只傳入策略名稱，提取已算好的全市場 DataFrame
+    raw_scan_df = run_scanner_cached(_stock_dict=stock_dict, strategy_name=strategy_name) # 👈 加上 _stock_dict=
+
+# ⚡ 開始零延遲 Pandas 記憶體過濾
+if raw_scan_df is not None and not raw_scan_df.empty:
+    df_filtered = raw_scan_df.copy()
+
+    # 1. 流動性與價位過濾
+    df_filtered = df_filtered[df_filtered["20日均量(張)"] >= min_vol]
+    if price_range == "高價股(100元以上)":
+        df_filtered = df_filtered[df_filtered["最新收盤價"] >= 100]
+    else:
+        df_filtered = df_filtered[df_filtered["最新收盤價"] < 100]
+    
+    # 2. 興櫃過濾
+    if exclude_emerging:
+        df_filtered = df_filtered[~df_filtered["Is_Emerging"]]
+
+    # 3. 雙引擎型態動態過濾
+    if "強勢創高" in entry_pattern or "弱勢破底" in entry_pattern:
+        # 🚀 引擎二：動能追擊
+        df_filtered = df_filtered[
+            df_filtered["Support_Holds"] & 
+            df_filtered["Momentum_Breakout"] & 
+            df_filtered["Vol_Surge"]
+        ]
+    else:
+        # 🛡️ 引擎一：潛伏回檔
+        min_thresh = 0.00 if "貼近均線" in entry_pattern else 0.03
+        max_thresh = 0.03 if "貼近均線" in entry_pattern else 0.08
+        df_filtered = df_filtered[
+            df_filtered["Support_Holds"] & 
+            df_filtered["Vol_Shrink"] & 
+            (df_filtered["Bias_Rate"] >= min_thresh) & 
+            (df_filtered["Bias_Rate"] <= max_thresh)
+        ]
+
+    scan_df = df_filtered
+else:
+    scan_df = pd.DataFrame()
 
 st.divider()
 

@@ -180,29 +180,10 @@ def calculate_historical_win_rate(
 def run_market_scanner(
     stock_dict: dict,
     strategy_name: str,
-    entry_pattern: str,
-    min_volume_sheets: int,
-    price_range: str,
-    exclude_emerging: bool = True,
-    new_tag_days: int = 3,
     strategy_config: dict | None = None,
-    min_vol: int = 0,  # 👈 新增這個參數，預設給 0
 ) -> pd.DataFrame:
     """
-    全市場掃描主邏輯 (純運算版，無 Streamlit 依賴)
-    
-    Args:
-        stock_dict: {stock_id: DataFrame} 的字典
-        strategy_name: 策略名稱
-        entry_pattern: 買點型態
-        min_volume_sheets: 最低 20 日均量 (張)
-        price_range: "高價股(100元以上)" 或 "低價股(100元以下)"
-        exclude_emerging: 是否排除興櫃/創櫃
-        new_tag_days: NEW 標籤天數
-        strategy_config: 策略設定字典 (若為 None 會從 config_manager 取得)
-    
-    Returns:
-        掃描結果 DataFrame
+    全市場掃描主邏輯 (極速預算版：只算全市場數據，不過濾 UI 條件)
     """
     if strategy_config is None:
         from src.config_manager import get_strategy_config
@@ -214,31 +195,18 @@ def run_market_scanner(
     long_ma = cfg["long_ma"]
     n_days = cfg["n_days"]
 
-    min_thresh, max_thresh = PATTERN_THRESHOLD_MAP.get(entry_pattern, (0.00, 0.05))
     results = []
+    is_short_strategy = "空" in strategy_name or "死" in strategy_name
 
     for stock_id, df_raw in stock_dict.items():
-        # 📌 興櫃與創櫃板過濾判斷
-        # 優先使用 FinMind type=emerging 清單 (emerging_stocks.txt)，零 API 成本
-        if exclude_emerging and is_emerging_stock(str(stock_id)):
-            continue
-
         lookback_bars = 350 if timeframe == "W" else 120
         df_slice = df_raw.tail(lookback_bars).copy()
 
         if len(df_slice) < 40:
             continue
-
+            
         latest_close = df_slice["Close"].iloc[-1]
         raw_avg_vol = (df_slice["Volume"] // 1000).tail(20).mean()
-
-        if raw_avg_vol < min_volume_sheets:
-            continue
-
-        if price_range == "高價股(100元以上)" and latest_close < 100:
-            continue
-        elif price_range == "低價股(100元以下)" and latest_close >= 100:
-            continue
 
         df = process_timeframe_and_ma(df_slice, timeframe, short_ma, long_ma)
         if len(df) < (long_ma + 5):
@@ -260,92 +228,67 @@ def run_market_scanner(
         current_ma_long = df["MA_long"].iloc[-1]
         ma_long_prev = df["MA_long"].iloc[-4] if len(df) >= 4 else current_ma_long
 
-        # 🛡️ 防禦性檢查：若 MA_long 為 NaN 或 0 (資料不足/異常) 則跳過
         if pd.isna(current_ma_long) or current_ma_long == 0:
             continue
 
-        # 📌 取得最新收盤價與量能數據
         close_price = df["Close"].iloc[-1]
-        current_vol = df["Volume"].iloc[-1]  # 今日成交量
-        vol_ma20 = df["Volume"].rolling(20).mean().iloc[-1] # 20日均量
+        current_vol = df["Volume"].iloc[-1]
+        vol_ma20 = df["Volume"].rolling(20).mean().iloc[-1]
 
-        # 🌟 基礎過濾：剔除流動性過低的殭屍股 (假設 UI 傳入 min_vol = 1000)
-        if vol_ma20 < min_volume_sheets:
-            continue
-
-        is_short_strategy = "空" in strategy_name or "死" in strategy_name
-
+        # 📌 預先計算雙引擎所需的所有布林/數值指標 (不過濾，全保留)
         if not is_short_strategy:
-            # ==========================================
-            # 📈 買進做多邏輯 (金叉 + 多頭 + 趨勢向上)
-            # ==========================================
             recent_cross_signal = golden_cross.tail(n_days).any()
             ma_alignment = df["MA_short"].iloc[-1] > df["MA_long"].iloc[-1]
             ma_trend = current_ma_long > ma_long_prev
             
             bias_rate = (close_price - current_ma_long) / current_ma_long
             support_holds = bias_rate >= -0.01
-
-            if max_thresh < 0.10: 
-                # 【核心一：潛伏回檔】
-                price_match = (bias_rate >= min_thresh) and (bias_rate <= max_thresh)
-                # 🌟 量能濾網：量縮回測 (今日量不可異常放大，最多不超過均量的 1.5 倍)
-                volume_match = current_vol <= (vol_ma20 * 1.5)
-            else:
-                # 【核心二：動能追擊】
-                recent_high = df["High"].tail(20).max()
-                price_match = (close_price >= recent_high * 0.97)
-                # 🌟 量能濾網：帶量突破 (今日量必須充足，至少有均量的 80% 水準)
-                volume_match = current_vol >= (vol_ma20 * 0.8)
-
-            is_pattern_valid = support_holds and price_match and volume_match
-
+            
+            recent_high = df["High"].tail(20).max()
+            momentum_breakout = (close_price >= recent_high * 0.97)
         else:
-            # ==========================================
-            # 📉 放空做空邏輯 (死叉 + 空頭 + 趨勢向下)
-            # ==========================================
             recent_cross_signal = death_cross.tail(n_days).any()
             ma_alignment = df["MA_short"].iloc[-1] < df["MA_long"].iloc[-1]
             ma_trend = current_ma_long < ma_long_prev
             
             bias_rate = (current_ma_long - close_price) / current_ma_long
-            resistance_holds = bias_rate >= -0.01
+            support_holds = bias_rate >= -0.01
+            
+            recent_low = df["Low"].tail(20).min()
+            momentum_breakout = (close_price <= recent_low * 1.03)
 
-            if max_thresh < 0.10:
-                # 【核心一：潛伏反彈】
-                price_match = (bias_rate >= min_thresh) and (bias_rate <= max_thresh)
-                # 🌟 量能濾網：無量反彈 (反彈過程量能萎縮，代表買盤無力)
-                volume_match = current_vol <= (vol_ma20 * 1.5)
-            else:
-                # 【核心二：弱勢追殺】
-                recent_low = df["Low"].tail(20).min()
-                price_match = (close_price <= recent_low * 1.03)
-                # 🌟 量能濾網：帶量下殺 (恐慌性賣壓湧現)
-                volume_match = current_vol >= (vol_ma20 * 0.8)
+        # 基礎門檻：連訊號或趨勢都沒有的，直接淘汰以省記憶體
+        if not (recent_cross_signal and ma_alignment and ma_trend):
+            continue
 
-            is_pattern_valid = resistance_holds and price_match and volume_match
+        vol_shrink = current_vol <= (vol_ma20 * 1.5)
+        vol_surge = current_vol >= (vol_ma20 * 0.8)
 
-        # 🎯 最終匯總
-        is_selected = recent_cross_signal and ma_alignment and ma_trend and is_pattern_valid
-        
-        if is_selected:
-            golden_indices = df[golden_cross].index
-            is_new_signal = False
-            if len(golden_indices) > 0:
-                last_cross_date = golden_indices[-1]
-                days_since_cross = (df.index[-1] - last_cross_date).days
-                if days_since_cross <= (new_tag_days * (7 if timeframe == "W" else 1)):
-                    is_new_signal = True
+        # 判定是否為 3 天內新訊號
+        cross_mask = death_cross if is_short_strategy else golden_cross
+        cross_indices = df[cross_mask].index
+        is_new_signal = False
+        if len(cross_indices) > 0:
+            last_cross_date = cross_indices[-1]
+            days_since_cross = (df.index[-1] - last_cross_date).days
+            if days_since_cross <= (3 * (7 if timeframe == "W" else 1)):
+                is_new_signal = True
 
-            results.append({
-                "Is_New": is_new_signal,
-                "股票代號": stock_id,
-                "股票名稱": stock_id,  # 會在 UI 層透過 stock_name_map 解析
-                "最新收盤價": round(latest_close, 2),
-                "20日均量(張)": int(raw_avg_vol),
-                "距長均線(%)": round((df["Close"].iloc[-1] - current_ma_long) / current_ma_long * 100, 2),
-                "週期形態": "周K" if timeframe == "W" else "日K",
-                "資料日期": df.index[-1].strftime("%Y-%m-%d"),
-            })
+        results.append({
+            "股票代號": stock_id,
+            "股票名稱": stock_id,
+            "最新收盤價": round(close_price, 2),
+            "20日均量(張)": int(raw_avg_vol),
+            "距長均線(%)": round(bias_rate * 100, 2),
+            "Bias_Rate": bias_rate,
+            "Support_Holds": support_holds,
+            "Momentum_Breakout": momentum_breakout,
+            "Vol_Shrink": vol_shrink,
+            "Vol_Surge": vol_surge,
+            "Is_New": is_new_signal,
+            "Is_Emerging": is_emerging_stock(str(stock_id)),
+            "週期形態": "周K" if timeframe == "W" else "日K",
+            "資料日期": df.index[-1].strftime("%Y-%m-%d"),
+        })
 
     return pd.DataFrame(results)
