@@ -30,15 +30,28 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "market_cache")
 
 
+def get_market_cache_key(cache_dir: str) -> str:
+    """抓取 market_cache 目錄下最新檔案的修改時間當作快取金鑰"""
+    if not os.path.exists(cache_dir):
+        return "0"
+    try:
+        # 遍歷資料夾取得最新的 mtime (防範只更新資料夾內單一檔案)
+        mtimes = [
+            os.path.getmtime(os.path.join(cache_dir, f))
+            for f in os.listdir(cache_dir)
+        ]
+        return str(max(mtimes)) if mtimes else str(os.path.getmtime(cache_dir))
+    except Exception:
+        return str(os.path.getmtime(cache_dir))
+
+
 @st.cache_data
-def load_market_data():
+def load_market_data(_cache_key: str):
     """載入市場資料並轉為字典引擎 (O(1) 查詢)"""
     try:
-        # 讀取分層 parquet 目錄
         df = pd.read_parquet(CACHE_DIR)
         df["Date"] = pd.to_datetime(df["Date"])
 
-        # 轉為 {stock_id: DataFrame} 字典
         grouped = df.groupby("Stock_ID")
         stock_dict = {
             stock_id: group.set_index("Date").sort_index()
@@ -50,8 +63,9 @@ def load_market_data():
         return {}
 
 
-# 載入資料
-stock_dict = load_market_data()
+# ⚡ 傳入最新修改時間當作 key，只要 Parquet 檔有變動就會自動重載
+current_mtime_key = get_market_cache_key(CACHE_DIR)
+stock_dict = load_market_data(_cache_key=current_mtime_key)
 
 if not stock_dict:
     st.warning(
@@ -70,7 +84,7 @@ def get_stock_name(stock_id):
 # 掃描器包裝函式 (帶快取)
 # ==========================================
 @st.cache_data
-def run_scanner_cached(_stock_dict, strategy_name):  # 👈 在 stock_dict 前加上底線
+def run_scanner_cached(_stock_dict, strategy_name):
     """只快取「基礎大掃描」的結果，與 UI 條件脫鉤"""
     return run_market_scanner(
         stock_dict=_stock_dict,
@@ -82,6 +96,19 @@ def run_scanner_cached(_stock_dict, strategy_name):  # 👈 在 stock_dict 前�
 # 側邊欄 UI - 策略選擇與參數設定
 # ==========================================
 st.sidebar.header("🎯 策略選擇")
+
+if stock_dict:
+    sample_stock = next(iter(stock_dict.values()))
+    latest_data_date = sample_stock.index[-1].strftime("%Y-%m-%d")
+
+    st.sidebar.divider()
+    st.sidebar.markdown("### 📅 資料更新狀態")
+    st.sidebar.caption(
+        f"• **當前數據日期**：`{latest_data_date}`\n\n"
+        f"• **首筆更新同步**：`17:00` 後 (16:30 觸發背景寫入)\n\n"
+        f"• **第二筆終點同步**：`00:00` (凌晨完整資料補齊)\n\n"
+        f"💡 *非更新時段系統採用靜態快取，免除無效載入。*"
+    )
 
 # 1. 交易方向單選按鈕
 trade_direction = st.sidebar.radio(
@@ -136,7 +163,7 @@ entry_pattern = st.sidebar.selectbox(
 # ==========================================
 with st.spinner(f"正在計算【{strategy_name}】全市場指標 (每日初次或切換策略時較久)..."):
     # 這裡只傳入策略名稱，提取已算好的全市場 DataFrame
-    raw_scan_df = run_scanner_cached(_stock_dict=stock_dict, strategy_name=strategy_name) # 👈 加上 _stock_dict=
+    raw_scan_df = run_scanner_cached(_stock_dict=stock_dict, strategy_name=strategy_name)
 
 # ⚡ 開始零延遲 Pandas 記憶體過濾
 if raw_scan_df is not None and not raw_scan_df.empty:
