@@ -11,6 +11,12 @@ venv/
 *.pickle
 *.csv
 check_stock_diff.py
+ARCHITECTURE.md
+decode_parquet.py
+migrate_cache.py
+rebalance_tiers.py
+sandbox_test.py
+sandbox_test_v2.py
 
 # 個人隱私設定或 API 金鑰
 .env
