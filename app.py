@@ -97,18 +97,6 @@ def run_scanner_cached(_stock_dict, strategy_name):
 # ==========================================
 st.sidebar.header("🎯 策略選擇")
 
-if stock_dict:
-    sample_stock = next(iter(stock_dict.values()))
-    latest_data_date = sample_stock.index[-1].strftime("%Y-%m-%d")
-
-    st.sidebar.divider()
-    st.sidebar.markdown("### 📅 資料更新狀態")
-    st.sidebar.caption(
-        f"• **當前數據日期**：`{latest_data_date}`\n\n"
-        f"• **首筆更新同步**：`17:00` 後\n\n"
-        f"• **全站更新同步**：`00:00`\n\n"
-    )
-
 # 1. 交易方向單選按鈕
 trade_direction = st.sidebar.radio(
     "交易方向",
@@ -156,6 +144,19 @@ entry_pattern = st.sidebar.selectbox(
     index=0,
     help=pattern_help,
 )
+
+if stock_dict:
+    sample_stock = next(iter(stock_dict.values()))
+    latest_data_date = sample_stock.index[-1].strftime("%Y-%m-%d")
+
+    st.sidebar.divider()
+    st.sidebar.markdown("### 📅 資料更新狀態")
+    st.sidebar.caption(
+        f"• **當前數據日期**：`{latest_data_date}`\n\n"
+        f"• **首筆更新同步**：每日`17:00` 後\n\n"
+        f"• **全站更新同步**：每日`00:00`\n\n"
+    )
+
 
 # ==========================================
 # 執行掃描與極速記憶體過濾
