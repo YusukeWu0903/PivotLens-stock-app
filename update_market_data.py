@@ -3,7 +3,7 @@ import time
 import json
 import pandas as pd
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dotenv import load_dotenv
 from FinMind.data import DataLoader
 import requests
@@ -32,7 +32,40 @@ MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "582"))
 CHECKPOINT_INTERVAL = int(os.getenv("UPDATE_CHECKPOINT_INTERVAL", "110"))
 # 請求間隔（秒）
 REQUEST_DELAY = float(os.getenv("UPDATE_REQUEST_DELAY", "1.0"))
+# 單支 API 最大等待秒數 (防止卡死)
+API_TIMEOUT = int(os.getenv("UPDATE_API_TIMEOUT", "30"))
 
+load_dotenv()
+FINMIND_TOKEN = os.getenv("FINMIND_TOKEN")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(BASE_DIR, "market_cache")
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "market_cache_checkpoint.parquet")
+BLACKLIST_FILE = os.path.join(BASE_DIR, "blacklist.txt")
+EMERGING_LIST_FILE = os.path.join(BASE_DIR, "emerging_stocks.txt")
+STOCK_NAMES_FILE = os.path.join(BASE_DIR, "stock_names.json")
+
+MARKET_INDICES = ["TAIEX", "TPEx"]
+MAX_WORKERS = int(os.getenv("UPDATE_MAX_WORKERS", "5"))
+MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "582"))
+CHECKPOINT_INTERVAL = int(os.getenv("UPDATE_CHECKPOINT_INTERVAL", "110"))
+REQUEST_DELAY = float(os.getenv("UPDATE_REQUEST_DELAY", "1.0"))
+API_TIMEOUT = int(os.getenv("UPDATE_API_TIMEOUT", "30"))
+
+load_dotenv()
+FINMIND_TOKEN = os.getenv("FINMIND_TOKEN")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(BASE_DIR, "market_cache")
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "market_cache_checkpoint.parquet")
+BLACKLIST_FILE = os.path.join(BASE_DIR, "blacklist.txt")
+EMERGING_LIST_FILE = os.path.join(BASE_DIR, "emerging_stocks.txt")
+STOCK_NAMES_FILE = os.path.join(BASE_DIR, "stock_names.json")
+
+MARKET_INDICES = ["TAIEX", "TPEx"]
+MAX_WORKERS = int(os.getenv("UPDATE_MAX_WORKERS", "5"))
+MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "582"))
+CHECKPOINT_INTERVAL = int(os.getenv("UPDATE_CHECKPOINT_INTERVAL", "110"))
+REQUEST_DELAY = float(os.getenv("UPDATE_REQUEST_DELAY", "1.0"))
+API_TIMEOUT = int(os.getenv("UPDATE_API_TIMEOUT", "30"))
 
 def fetch_single_stock_daily(dl: DataLoader, stock_id: str, start_date: str, end_date: str) -> pd.DataFrame | None:
     """
@@ -177,7 +210,7 @@ def update_market_cache():
         print(f"\n⚠️ 無法取得股票清單: {e}")
         return
 
-    # 讀取黑名單，過濾殭屍股
+    # 讀取黑名單，過濾殭屍股 (僅讀取，不自動寫入)
     blacklist = set()
     if os.path.exists(BLACKLIST_FILE):
         with open(BLACKLIST_FILE, "r") as f:
@@ -248,78 +281,71 @@ def update_market_cache():
     failed_stocks = []
     completed = 0
 
+    # 🔑 關鍵優化：使用 wait() + timeout 避免 API 卡死
+    # 每支 API 最多等待 API_TIMEOUT 秒，超時即標記失敗
+    API_TIMEOUT = 30  # 秒
+    
     # 使用 ThreadPoolExecutor，共用 dl 實例
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(fetch_single_stock_daily, dl, sid, fetch_tasks[sid], today_str): sid
             for sid in target_stocks
         }
-        for future in as_completed(futures):
-            res = future.result()
-            sid = futures[future]
-            if res is not None and not res.empty:
-                new_dfs.append(res)
-            else:
-                failed_stocks.append(sid)
-
-            completed += 1
-
-            # ARCHITECTURE 1.2：每抓滿 CHECKPOINT_INTERVAL 檔，中途強制存檔一次！
-            if completed % CHECKPOINT_INTERVAL == 0:
-                print(f"💾 【進度中繼點】已完成 {completed} 檔，正在進行中途快取存檔...")
-                if new_dfs:
-                    temp_df = pd.concat(new_dfs, ignore_index=True)
-                    temp_df = temp_df.rename(columns={
-                        'date': 'Date', 'stock_id': 'Stock_ID', 'close': 'Close',
-                        'Trading_Volume': 'Volume', 'max': 'High', 'min': 'Low', 'open': 'Open'
-                    })
-                    temp_df['Date'] = pd.to_datetime(temp_df['Date'])
-                    temp_df = _normalize_stock_id(temp_df)
-                    temp_final = pd.concat([existing_df, temp_df], ignore_index=True) if not existing_df.empty else temp_df
-                    # ARCHITECTURE 2.1：合併後強制統一型態，防止去重失效
-                    temp_final = _normalize_concat(temp_final)
-                    # ARCHITECTURE 2.1：去除重複值 (以暫存檔最新資料為準)
-                    temp_final = temp_final.drop_duplicates(subset=['Stock_ID', 'Date'], keep='last').sort_values(['Stock_ID', 'Date'])
-                    # 中途存檔不分區（避免 Tier 欄位尚未建立），最終存檔時再分區
-                    # 使用臨時檔案名稱，避免與分區目錄衝突
-                    temp_final.to_parquet(CHECKPOINT_FILE, index=False)
-
-            if completed % 50 == 0 or completed == len(target_stocks):
-                print(f"⏳ 進度: {completed}/{len(target_stocks)}")
-            time.sleep(REQUEST_DELAY)
-
-    # 🔄 同輪次重試機制：對失敗股票進行即時重試 (最多 2 次，指數退避)
-    MAX_RETRIES = 2
-    RETRY_DELAY = 5  # 秒
-    
-    for attempt in range(1, MAX_RETRIES + 1):
-        if not failed_stocks:
-            break
         
-        print(f"🔄 第 {attempt} 次重試，剩餘 {len(failed_stocks)} 檔失敗股票...")
-        retry_stocks = failed_stocks.copy()
-        failed_stocks = []
+        pending = set(futures.keys())
+        completed = 0
         
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(fetch_single_stock_daily, dl, sid, fetch_tasks[sid], today_str): sid
-                for sid in retry_stocks
-            }
-            for future in as_completed(futures):
-                res = future.result()
+        while pending:
+            # 等待至少一個完成，最多等待 API_TIMEOUT 秒
+            done, pending = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+            
+            for future in done:
                 sid = futures[future]
-                if res is not None and not res.empty:
-                    new_dfs.append(res)
-                    print(f"   ✅ 重試成功: {sid}")
-                else:
+                try:
+                    res = future.result(timeout=0)  # 已完成，不阻塞
+                    if res is not None and not res.empty:
+                        new_dfs.append(res)
+                    else:
+                        failed_stocks.append(sid)
+                except Exception as e:
+                    print(f"  ⚠️ {sid}: 執行失敗 - {e}")
                     failed_stocks.append(sid)
-        
-        if failed_stocks and attempt < MAX_RETRIES:
-            time.sleep(RETRY_DELAY * attempt)  # 指數退避: 5s, 10s
-    
-    # 最終仍失敗的，印出警告但不寫入黑名單，留待下一輪排程補抓
+
+                completed += 1
+                
+                # ARCHITECTURE 1.2：每抓滿 CHECKPOINT_INTERVAL 檔，中途強制存檔一次！
+                if completed % CHECKPOINT_INTERVAL == 0:
+                    print(f"💾 【進度中繼點】已完成 {completed} 檔，正在進行中途快取存檔...")
+                    if new_dfs:
+                        temp_df = pd.concat(new_dfs, ignore_index=True)
+                        temp_df = temp_df.rename(columns={
+                            'date': 'Date', 'stock_id': 'Stock_ID', 'close': 'Close',
+                            'Trading_Volume': 'Volume', 'max': 'High', 'min': 'Low', 'open': 'Open'
+                        })
+                        temp_df['Date'] = pd.to_datetime(temp_df['Date'])
+                        temp_df = _normalize_stock_id(temp_df)
+                        temp_final = pd.concat([existing_df, temp_df], ignore_index=True) if not existing_df.empty else temp_df
+                        temp_final = _normalize_concat(temp_final)
+                        temp_final = temp_final.drop_duplicates(subset=['Stock_ID', 'Date'], keep='last').sort_values(['Stock_ID', 'Date'])
+                        temp_final.to_parquet(CHECKPOINT_FILE, index=False)
+
+                if completed % 50 == 0 or completed == len(target_stocks):
+                    print(f"⏳ 進度: {completed}/{len(target_stocks)}")
+                
+                # 控制請求頻率
+                time.sleep(REQUEST_DELAY)
+            
+            # 處理逾時未完成的 future
+            if pending:
+                timed_out = [futures[f] for f in pending]
+                print(f"⚠️ {len(timed_out)} 支 API 逾時 (30s)，標記為失敗：{timed_out[:5]}...")
+                failed_stocks.extend(timed_out)
+                for f in pending:
+                    f.cancel()
+
+    # 最終失敗的，印出警告但不寫入黑名單，留待下一輪排程補抓
     if failed_stocks:
-        print(f"⚠️ 經 {MAX_RETRIES} 次重試仍失敗 {len(failed_stocks)} 檔: {failed_stocks[:10]}... 將留待下一輪排程補抓")
+        print(f"⚠️ 本批次失敗 {len(failed_stocks)} 檔: {failed_stocks[:10]}... 將留待下一輪排程補抓")
 
     # 📌 最終完整存檔：加入 Tier 分層欄位並分區寫入
     if new_dfs:
