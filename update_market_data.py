@@ -89,14 +89,14 @@ def read_existing_cache() -> pd.DataFrame:
     """ARCHITECTURE 1.2：同時讀取主快取與暫存檔，暫存檔覆蓋舊資料，斷點續傳"""
     df_main = pd.DataFrame()
     df_checkpoint = pd.DataFrame()
-
+    
     if os.path.exists(CACHE_DIR):
         try:
             df_main = pd.read_parquet(CACHE_DIR)
             df_main = _normalize_stock_id(df_main)
         except Exception as e:
             print(f"⚠️ 讀取主快取失敗: {e}")
-
+            
     if os.path.exists(CHECKPOINT_FILE):
         try:
             df_checkpoint = pd.read_parquet(CHECKPOINT_FILE)
@@ -104,14 +104,14 @@ def read_existing_cache() -> pd.DataFrame:
             print(f"♻️ 偵測到中斷暫存檔，已自動載入 {len(df_checkpoint)} 筆復原資料！")
         except Exception as e:
             print(f"⚠️ 讀取暫存檔失敗: {e}")
-
+            
     if df_main.empty and df_checkpoint.empty:
         return pd.DataFrame()
-
+        
     combined_df = pd.concat([df_main, df_checkpoint], ignore_index=True)
     # ARCHITECTURE 2.1：合併後強制統一型態，防止去重失效
     combined_df = _normalize_concat(combined_df)
-
+    
     # ARCHITECTURE 2.1：去除重複值 (以暫存檔的最新資料為準, keep='last' 讓暫存覆蓋舊資料)
     combined_df = combined_df.drop_duplicates(subset=['Stock_ID', 'Date'], keep='last')
     return combined_df
@@ -144,12 +144,12 @@ def update_market_cache():
             (~df_info['industry_category'].isin(['ETF', '存託憑證', '受益證券', ''])) &
             (df_info['stock_id'].str.len() == 4)
         ]['stock_id'].unique().tolist()
-
+        
         # 🚀 VIP 霸王條款：強制加入大盤指數（不受 4 位數限制）
         for idx in MARKET_INDICES:
             if idx not in all_stocks:
                 all_stocks.insert(0, idx)
-
+        
         # ARCHITECTURE 1.3：生成興櫃股票清單 (type=emerging) 供 UI 層離線使用
         try:
             emerging_stocks = df_info[df_info['type'] == 'emerging']['stock_id'].astype(str).tolist()
@@ -159,7 +159,7 @@ def update_market_cache():
             print(f"✅ 已更新興櫃清單：{len(emerging_stocks)} 檔 (emerging_stocks.txt)")
         except Exception as e:
             print(f"⚠️ 無法寫入興櫃清單: {e}")
-
+            
         # 📌 生成股票名稱對照表 (供 UI 層離線讀取，避免 UI 發 API 請求)
         try:
             name_map = {
@@ -172,7 +172,7 @@ def update_market_cache():
             print(f"✅ 已更新股票名稱對照表：{len(name_map)} 檔 (stock_names.json)")
         except Exception as e:
             print(f"⚠️ 無法寫入股票名稱清單: {e}")
-
+                
     except Exception as e:
         print(f"\n⚠️ 無法取得股票清單: {e}")
         return
@@ -225,11 +225,11 @@ def update_market_cache():
     if not existing_df.empty:
         # 計算每檔股票近 20 日平均成交量 (零 API 成本，純本地運算)
         vol_rank = existing_df.groupby("Stock_ID")["Volume"].apply(lambda x: x.tail(20).mean()).to_dict()
-
+        
         # 🏆 VIP 霸王條款：大盤指數強制設為無限大，保證排第 1、2 名
         for idx in MARKET_INDICES:
             vol_rank[idx] = float('inf')
-
+        
         # 依均量由大到小排序；無歷史資料的新股票預設為 0 (排最後)
         needs_update.sort(key=lambda sid: vol_rank.get(sid, 0), reverse=True)
         print(f"🔥 已依據歷史 20 日均量完成優先級排序（大盤指數 VIP 置頂），將優先更新前 {MAX_STOCKS_PER_RUN} 大標的")
@@ -288,7 +288,40 @@ def update_market_cache():
                 print(f"⏳ 進度: {completed}/{len(target_stocks)}")
             time.sleep(REQUEST_DELAY)
 
-                # 📌 最終完整存檔：加入 Tier 分層欄位並分區寫入
+    # 🔄 同輪次重試機制：對失敗股票進行即時重試 (最多 2 次，指數退避)
+    MAX_RETRIES = 2
+    RETRY_DELAY = 5  # 秒
+    
+    for attempt in range(1, MAX_RETRIES + 1):
+        if not failed_stocks:
+            break
+        
+        print(f"🔄 第 {attempt} 次重試，剩餘 {len(failed_stocks)} 檔失敗股票...")
+        retry_stocks = failed_stocks.copy()
+        failed_stocks = []
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(fetch_single_stock_daily, dl, sid, fetch_tasks[sid], today_str): sid
+                for sid in retry_stocks
+            }
+            for future in as_completed(futures):
+                res = future.result()
+                sid = futures[future]
+                if res is not None and not res.empty:
+                    new_dfs.append(res)
+                    print(f"   ✅ 重試成功: {sid}")
+                else:
+                    failed_stocks.append(sid)
+        
+        if failed_stocks and attempt < MAX_RETRIES:
+            time.sleep(RETRY_DELAY * attempt)  # 指數退避: 5s, 10s
+    
+    # 最終仍失敗的，印出警告但不寫入黑名單，留待下一輪排程補抓
+    if failed_stocks:
+        print(f"⚠️ 經 {MAX_RETRIES} 次重試仍失敗 {len(failed_stocks)} 檔: {failed_stocks[:10]}... 將留待下一輪排程補抓")
+
+    # 📌 最終完整存檔：加入 Tier 分層欄位並分區寫入
     if new_dfs:
         df_batch = pd.concat(new_dfs, ignore_index=True)
         df_batch = df_batch.rename(columns={
@@ -297,14 +330,14 @@ def update_market_cache():
         })
         df_batch['Date'] = pd.to_datetime(df_batch['Date'])
         df_batch = _normalize_stock_id(df_batch)
-
+        
         final_df = pd.concat([existing_df, df_batch], ignore_index=True) if not existing_df.empty else df_batch
         # ARCHITECTURE 2.1：合併後強制統一型態（Date→datetime、Stock_ID→str），防 concat upcast 致去重失效
         final_df = _normalize_concat(final_df)
         # ARCHITECTURE 2.1：去除重複值，防止資料分裂與重複 K 線
         final_df = final_df.drop_duplicates(subset=['Stock_ID', 'Date'], keep='last').sort_values(['Stock_ID', 'Date'])
         final_df = _normalize_stock_id(final_df)
-
+        
         # ==========================================
         # 🚀 關鍵 (ARCHITECTURE 1.1)：為每筆資料加上 Tier 分層標籤
         # 【徹底解鎖版】每次存檔強制對「所有已抓取股票」重新計算均量排名，保證數量精準不膨脹！
@@ -316,34 +349,34 @@ def update_market_cache():
         # 2. 🏆 VIP 霸王條款：確保大盤指數永遠排第一、第二
         for idx in MARKET_INDICES:
             latest_vol_rank[idx] = float('inf')
-
+        
         # 3. 將所有股票依照均量由大到小排序
         all_sids = list(latest_vol_rank.keys())
         all_sids.sort(key=lambda sid: latest_vol_rank.get(sid, 0), reverse=True)
         
         # 4. 依照絕對排名分配 Tier (1~552: tier1_hot | 553~1102: tier2_warm | 其餘: tier3_cold)
         tier_map = {sid: get_tier(rank + 1) for rank, sid in enumerate(all_sids)}
-
+        
         # 5. 無視舊有 Tier，強制將重新計算的精準 Tier 覆寫上去
         final_df['Tier'] = final_df['Stock_ID'].map(tier_map).fillna('tier3_cold').astype(str)
-
+        
         # ARCHITECTURE 1.1：寫入前先清空舊分區目錄，防止 Parquet 碎片檔案無限增生與 Git 空間膨脹
         if os.path.exists(CACHE_DIR):
             import shutil
             shutil.rmtree(CACHE_DIR)
             print(f"🧹 已清空舊快取目錄，準備寫入新分區檔案...")
-
+        
         # 分區寫入：partition_cols=['Tier'] 會自動建立 tier1_hot/、tier2_warm/、tier3_cold/ 子目錄
         final_df.to_parquet(CACHE_DIR, index=False, partition_cols=['Tier'])
-
+        
         updated_total = len(final_df['Stock_ID'].unique())
         new_latest_date = final_df['Date'].max().strftime('%Y-%m-%d')
-
+        
         # 統計各 Tier 筆數
         tier_stock_counts = final_df.groupby('Tier')['Stock_ID'].nunique().to_dict()
         print(f"✅ 本批次 {len(target_stocks)} 檔存檔成功！全台股覆蓋率: {updated_total}/{len(all_stocks)} | 最新日期: {new_latest_date}")
         print(f"   📦 各層股票數: {tier_stock_counts}")
-
+        
         # 🔔 完美提醒！
         if len(needs_update) > MAX_STOCKS_PER_RUN:
             print(f"⏳ 本次 {MAX_STOCKS_PER_RUN} 檔已完美收工！為避免超過 API 每小時限制，請【休息 1 小時】後再執行下一批！")
