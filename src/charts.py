@@ -84,6 +84,17 @@ def render_kline_chart(
     st.divider()
 
     # ========== K 線圖繪製 ==========
+    # 先在全區間算好交叉訊號，再取 tail，避免被切斷導致 shift(1) 失真
+    is_short_strategy = "空" in strategy_name or "死" in strategy_name
+    df_selected["Golden_Cross"] = (
+        (df_selected["MA_short"] > df_selected["MA_long"]) & 
+        (df_selected["MA_short"].shift(1) <= df_selected["MA_long"].shift(1))
+    )
+    df_selected["Death_Cross"] = (
+        (df_selected["MA_short"] < df_selected["MA_long"]) & 
+        (df_selected["MA_short"].shift(1) >= df_selected["MA_long"].shift(1))
+    )
+
     df_chart = df_selected.tail(90).reset_index()
     df_chart["Volume_Sheets"] = df_chart["Volume"] // 1000
     df_chart["Prev_Close"] = df_chart["Close"].shift(1).fillna(df_chart["Open"])
@@ -186,6 +197,50 @@ def render_kline_chart(
         row=1,
         col=1,
     )
+
+    # ==========================================
+    # 🎯 標註訊號箭頭 (在 K 線圖上疊加)
+    # ==========================================
+    if not is_short_strategy:
+        # 畫黃金交叉 (紅色向上箭頭)
+        df_golden = df_chart[df_chart["Golden_Cross"]]
+        if not df_golden.empty:
+            golden_x = df_golden["Date"].dt.strftime("%Y-%m-%d").tolist()
+            # Y 座標設在當天最低價的下方 (乘 0.98 微調，避免貼太近擋住K線)
+            golden_y = df_golden["Low"] * 0.98
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=golden_x,
+                    y=golden_y,
+                    mode="markers",
+                    marker=dict(symbol="triangle-up", color="#ef5350", size=14, line=dict(width=1, color="white")),
+                    name="黃金交叉",
+                    hoverinfo="skip"
+                ),
+                row=1,
+                col=1,
+            )
+    else:
+        # 畫死亡交叉 (綠色向下箭頭)
+        df_death = df_chart[df_chart["Death_Cross"]]
+        if not df_death.empty:
+            death_x = df_death["Date"].dt.strftime("%Y-%m-%d").tolist()
+            # Y 座標設在當天最高價的上方 (乘 1.02 微調)
+            death_y = df_death["High"] * 1.02
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=death_x,
+                    y=death_y,
+                    mode="markers",
+                    marker=dict(symbol="triangle-down", color="#26a69a", size=14, line=dict(width=1, color="white")),
+                    name="死亡交叉",
+                    hoverinfo="skip"
+                ),
+                row=1,
+                col=1,
+            )
 
     # 成交量柱狀圖
     price_diff = df_chart["Close"].diff().fillna(0)
