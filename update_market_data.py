@@ -26,8 +26,8 @@ MARKET_INDICES = ["TAIEX", "TPEx"]
 
 # 可配置的多執行緒數量（預設 5，可透過環境變數覆蓋）
 MAX_WORKERS = int(os.getenv("UPDATE_MAX_WORKERS", "5"))
-# 單次執行最大更新檔數：552 = 2 檔大盤指數 + 550 檔熱門股
-MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "552"))
+# 單次執行最大更新檔數：582 = 2 檔大盤指數 + 580 檔熱門股 (約 2300 檔 / 4 批次)
+MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "582"))
 # 中途存檔間隔 (ARCHITECTURE 1.2：每 110 筆)
 CHECKPOINT_INTERVAL = int(os.getenv("UPDATE_CHECKPOINT_INTERVAL", "110"))
 # 請求間隔（秒）
