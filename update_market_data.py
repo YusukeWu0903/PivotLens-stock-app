@@ -288,16 +288,7 @@ def update_market_cache():
                 print(f"⏳ 進度: {completed}/{len(target_stocks)}")
             time.sleep(REQUEST_DELAY)
 
-    # 抓不到資料的寫入黑名單 (條件：只有要求抓「一年歷史」卻失敗的，才認定為死檔)
-    default_start = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
-    real_dead_stocks = [s for s in failed_stocks if fetch_tasks[s] == default_start]
-    if real_dead_stocks:
-        with open(BLACKLIST_FILE, "a") as f:
-            for sid in real_dead_stocks:
-                f.write(f"{sid}\n")
-        print(f"🚫 發現 {len(real_dead_stocks)} 檔無法取得歷史資料，已永久加入黑名單！")
-
-    # 📌 最終完整存檔：加入 Tier 分層欄位並分區寫入
+                # 📌 最終完整存檔：加入 Tier 分層欄位並分區寫入
     if new_dfs:
         df_batch = pd.concat(new_dfs, ignore_index=True)
         df_batch = df_batch.rename(columns={
