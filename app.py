@@ -31,18 +31,19 @@ CACHE_DIR = os.path.join(BASE_DIR, "market_cache")
 
 
 def get_market_cache_key(cache_dir: str) -> str:
-    """抓取 market_cache 目錄下最新檔案的修改時間當作快取金鑰"""
+    """遞迴掃描所有 .parquet 檔案的 mtime，取最大值作為快取金鑰"""
     if not os.path.exists(cache_dir):
         return "0"
     try:
-        # 遍歷資料夾取得最新的 mtime (防範只更新資料夾內單一檔案)
-        mtimes = [
-            os.path.getmtime(os.path.join(cache_dir, f))
-            for f in os.listdir(cache_dir)
-        ]
-        return str(max(mtimes)) if mtimes else str(os.path.getmtime(cache_dir))
+        mtimes = []
+        for root, dirs, files in os.walk(cache_dir):
+            for f in files:
+                if f.endswith('.parquet'):
+                    filepath = os.path.join(root, f)
+                    mtimes.append(os.path.getmtime(filepath))
+        return str(max(mtimes)) if mtimes else "0"
     except Exception:
-        return str(os.path.getmtime(cache_dir))
+        return "0"
 
 
 @st.cache_data
