@@ -330,6 +330,7 @@ def update_market_cache():
                     else:
                         failed_stocks.append(sid)
                         consecutive_failures += 1
+                        print(f"  ⚠️ {sid}: 回傳空資料 (可能下市/停牌/無交易)")
                 except Exception as e:
                     print(f"  ⚠️ {sid}: 執行失敗 - {e}")
                     failed_stocks.append(sid)
