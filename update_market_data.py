@@ -329,12 +329,12 @@ def update_market_cache():
                         consecutive_failures = 0  # 成功即重置熔斷計數
                     else:
                         failed_stocks.append(sid)
-                        consecutive_failures += 1
-                        print(f"  ⚠️ {sid}: 回傳空資料 (可能下市/停牌/無交易)")
+                        # ❌ 空資料不計入熔斷計數器 - 暫時停牌/無成交非錯誤
+                        print(f"  ⚠️ {sid}: 回傳空資料 (可能停牌/無成交/暫時無交易)")
                 except Exception as e:
                     print(f"  ⚠️ {sid}: 執行失敗 - {e}")
                     failed_stocks.append(sid)
-                    consecutive_failures += 1
+                    consecutive_failures += 1  # ✅ 只有真正例外才計入熔斷
 
                 completed += 1
 
