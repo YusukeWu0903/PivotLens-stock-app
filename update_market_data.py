@@ -304,16 +304,26 @@ def update_market_cache():
         }
 
         pending = set(futures.keys())
-
         consecutive_failures = 0  # 熔斷器計數器
 
         while pending:
+            # 等待至少一個任務完成，最多等 API_TIMEOUT 秒
             done, pending = wait(pending, timeout=API_TIMEOUT, return_when=FIRST_COMPLETED)
 
+            # 🚨 真正的超時檢查：如果 30 秒過去了，連 1 個任務都沒做完 (done 是空的)
+            if not done:
+                timed_out = [futures[f] for f in pending]
+                print(f"⚠️ 嚴重卡死 ({API_TIMEOUT}s)，放棄剩餘 {len(timed_out)} 支股票...")
+                failed_stocks.extend(timed_out)
+                for f in pending:
+                    f.cancel()
+                break  # 直接跳出迴圈，結束這批
+
+            # 處理已經完成的任務
             for future in done:
                 sid = futures[future]
                 try:
-                    res = future.result(timeout=0)
+                    res = future.result(timeout=0)  # 已經完成，不用再設定 timeout
                     if res is not None and not res.empty:
                         new_dfs.append(res)
                         consecutive_failures = 0  # 成功即重置熔斷計數
@@ -332,8 +342,6 @@ def update_market_cache():
                     print(f"🚨 熔斷器觸發：連續 {consecutive_failures} 次失敗，暫停 {CIRCUIT_BREAKER_WAIT} 秒冷卻...")
                     time.sleep(CIRCUIT_BREAKER_WAIT)
                     consecutive_failures = 0  # 冷卻後歸零
-
-                completed += 1
 
                 # ARCHITECTURE 1.2：每抓滿 CHECKPOINT_INTERVAL 檔，中途強制存檔一次！
                 if completed % CHECKPOINT_INTERVAL == 0:
@@ -355,12 +363,7 @@ def update_market_cache():
                     print(f"⏳ 進度: {completed}/{len(target_stocks)}")
                 time.sleep(REQUEST_DELAY)
 
-            if pending:
-                timed_out = [futures[f] for f in pending]
-                print(f"⚠️ {len(timed_out)} 支 API 逾時 ({API_TIMEOUT}s)，標記為失敗：{timed_out[:5]}...")
-                failed_stocks.extend(timed_out)
-                for f in pending:
-                    f.cancel()
+        # 迴圈正常結束 (pending 為空)，不需要額外處理
 
     # ========== 失敗記錄到觀察清單 (不封鎖) ==========
     if failed_stocks:
@@ -437,7 +440,7 @@ if __name__ == "__main__":
     try:
         update_market_cache()
     finally:
-        # ARCHITECTURE 1.2：程式結束時的最後防線，無論成功/失敗/無新資料，確保幽靈暫存檔徹底刪除
+        # ARCHITECTURE 1.2：程式結束時的最後防線，無論成功/失敗/無新資料，確保幽靈暫存檔徹底清除
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
             print("🧹 程式結束，已確保中斷暫存檔被徹底清除。")
