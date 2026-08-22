@@ -29,10 +29,10 @@ STOCK_NAMES_FILE = os.path.join(BASE_DIR, "stock_names.json")
 MARKET_INDICES = ["TAIEX", "TPEx"]
 
 # 可配置參數
-MAX_WORKERS = int(os.getenv("UPDATE_MAX_WORKERS", "5"))
+MAX_WORKERS = int(os.getenv("UPDATE_MAX_WORKERS", "2"))
 MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "582"))
 CHECKPOINT_INTERVAL = int(os.getenv("UPDATE_CHECKPOINT_INTERVAL", "110"))
-REQUEST_DELAY = float(os.getenv("UPDATE_REQUEST_DELAY", "1.0"))
+REQUEST_DELAY = float(os.getenv("UPDATE_REQUEST_DELAY", "2.0"))
 API_TIMEOUT = int(os.getenv("UPDATE_API_TIMEOUT", "30"))
 # 暫時黑名單過期天數 (預設 30 天)
 TEMP_BLACKLIST_DAYS = int(os.getenv("TEMP_BLACKLIST_DAYS", "30"))
