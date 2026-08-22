@@ -29,32 +29,47 @@ STOCK_NAMES_FILE = os.path.join(BASE_DIR, "stock_names.json")
 MARKET_INDICES = ["TAIEX", "TPEx"]
 
 # 可配置參數
-MAX_WORKERS = int(os.getenv("UPDATE_MAX_WORKERS", "2"))
-MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "582"))
+MAX_WORKERS = int(os.getenv("UPDATE_MAX_WORKERS", "1"))
+MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "200"))
 CHECKPOINT_INTERVAL = int(os.getenv("UPDATE_CHECKPOINT_INTERVAL", "110"))
-REQUEST_DELAY = float(os.getenv("UPDATE_REQUEST_DELAY", "2.0"))
+REQUEST_DELAY = float(os.getenv("UPDATE_REQUEST_DELAY", "3.0"))
+# 單支 API 最大等待秒數 (防止卡死)
 API_TIMEOUT = int(os.getenv("UPDATE_API_TIMEOUT", "30"))
 # 暫時黑名單過期天數 (預設 30 天)
 TEMP_BLACKLIST_DAYS = int(os.getenv("TEMP_BLACKLIST_DAYS", "30"))
+# 熔斷器參數
+CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "3"))
+CIRCUIT_BREAKER_WAIT = int(os.getenv("CIRCUIT_BREAKER_WAIT", "60"))
 
 
 def fetch_single_stock_daily(dl: DataLoader, stock_id: str, start_date: str, end_date: str) -> pd.DataFrame | None:
-    """使用共用的 DataLoader 實例抓取單一股票日線資料。"""
+    """
+    使用共用的 DataLoader 實例抓取單一股票日線資料。
+    回傳 DataFrame 或 None（失敗）。
+    """
     try:
         df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_date, end_date=end_date)
         if not df.empty:
             return df
     except requests.exceptions.Timeout:
-        print(f"  ⚠️ {stock_id}: 請求逾時")
+        print(f"  ⚠️ {stock_id}: 請求逾時 (HTTP Timeout)")
+    except requests.exceptions.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else "Unknown"
+        print(f"  ⚠️ {stock_id}: HTTP 錯誤 {status_code} - {e}")
     except requests.exceptions.RequestException as e:
         print(f"  ⚠️ {stock_id}: 網路請求錯誤 - {e}")
     except Exception as e:
-        print(f"  ⚠️ {stock_id}: 未預期錯誤 - {e}")
+        print(f"  ⚠️ {stock_id}: 未預期錯誤 - {type(e).__name__}: {e}")
     return None
 
 
 def get_tier(rank: int) -> str:
-    """根據優先級排名決定儲存分層 (ARCHITECTURE 1.1)"""
+    """
+    根據優先級排名決定儲存分層 (ARCHITECTURE 1.1)
+    Rank 1~552  -> tier1_hot  (第一批：大盤指數 + 550 檔熱門股)
+    Rank 553~1102 -> tier2_warm (第二批：550 檔中型股)
+    Rank 1103~    -> tier3_cold (其餘冷門股)
+    """
     if rank <= 552:
         return "tier1_hot"
     elif rank <= 1102:
@@ -290,6 +305,8 @@ def update_market_cache():
 
         pending = set(futures.keys())
 
+        consecutive_failures = 0  # 熔斷器計數器
+
         while pending:
             done, pending = wait(pending, timeout=API_TIMEOUT, return_when=FIRST_COMPLETED)
 
@@ -299,14 +316,26 @@ def update_market_cache():
                     res = future.result(timeout=0)
                     if res is not None and not res.empty:
                         new_dfs.append(res)
+                        consecutive_failures = 0  # 成功即重置熔斷計數
                     else:
                         failed_stocks.append(sid)
+                        consecutive_failures += 1
                 except Exception as e:
                     print(f"  ⚠️ {sid}: 執行失敗 - {e}")
                     failed_stocks.append(sid)
+                    consecutive_failures += 1
 
                 completed += 1
 
+                # 🚨 熔斷器：連續失敗超過閾值，等待冷卻後重試
+                if consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
+                    print(f"🚨 熔斷器觸發：連續 {consecutive_failures} 次失敗，暫停 {CIRCUIT_BREAKER_WAIT} 秒冷卻...")
+                    time.sleep(CIRCUIT_BREAKER_WAIT)
+                    consecutive_failures = 0  # 冷卻後歸零
+
+                completed += 1
+
+                # ARCHITECTURE 1.2：每抓滿 CHECKPOINT_INTERVAL 檔，中途強制存檔一次！
                 if completed % CHECKPOINT_INTERVAL == 0:
                     print(f"💾 【進度中繼點】已完成 {completed} 檔，正在進行中途快取存檔...")
                     if new_dfs:
@@ -340,7 +369,7 @@ def update_market_cache():
             with open(WATCHLIST_FILE, "a") as f:
                 now_iso = datetime.now().isoformat()
                 for sid in failed_stocks:
-                    f.write(f"{sid},{now_iso}\n")
+                    f.write(f"{sid},{datetime.now().isoformat()}\n")
         except Exception as e:
             print(f"⚠️ 寫入觀察清單失敗: {e}")
 
@@ -359,31 +388,45 @@ def update_market_cache():
         final_df = final_df.drop_duplicates(subset=['Stock_ID', 'Date'], keep='last').sort_values(['Stock_ID', 'Date'])
         final_df = _normalize_stock_id(final_df)
 
-        # Tier 分層計算
+        # ==========================================
+        # 🚀 關鍵 (ARCHITECTURE 1.1)：為每筆資料加上 Tier 分層標籤
+        # ==========================================
+
+        # 1. 計算當前資料庫中「所有股票」的近 20 日平均成交量
         latest_vol_rank = final_df.groupby("Stock_ID")["Volume"].apply(lambda x: x.tail(20).mean()).to_dict()
+
+        # 2. 🏆 VIP 霸王條款：確保大盤指數永遠排第一、第二
         for idx in MARKET_INDICES:
             latest_vol_rank[idx] = float('inf')
 
+        # 3. 將所有股票依照均量由大到小排序
         all_sids = list(latest_vol_rank.keys())
         all_sids.sort(key=lambda sid: latest_vol_rank.get(sid, 0), reverse=True)
+
+        # 4. 依照絕對排名分配 Tier (1~552: tier1_hot | 553~1102: tier2_warm | 其餘: tier3_cold)
         tier_map = {sid: get_tier(rank + 1) for rank, sid in enumerate(all_sids)}
 
+        # 5. 無視舊有 Tier，強制將重新計算的精準 Tier 覆寫上去
         final_df['Tier'] = final_df['Stock_ID'].map(tier_map).fillna('tier3_cold').astype(str)
 
+        # ARCHITECTURE 1.1：寫入前先清空舊分區目錄，防止 Parquet 碎片檔案無限增生與 Git 空間膨脹
         if os.path.exists(CACHE_DIR):
             import shutil
             shutil.rmtree(CACHE_DIR)
             print(f"🧹 已清空舊快取目錄，準備寫入新分區檔案...")
 
+        # 分區寫入：partition_cols=['Tier'] 會自動建立 tier1_hot/、tier2_warm/、tier3_cold/ 子目錄
         final_df.to_parquet(CACHE_DIR, index=False, partition_cols=['Tier'])
 
         updated_total = len(final_df['Stock_ID'].unique())
         new_latest_date = final_df['Date'].max().strftime('%Y-%m-%d')
-        tier_stock_counts = final_df.groupby('Tier')['Stock_ID'].nunique().to_dict()
 
+        # 統計各 Tier 筆數
+        tier_stock_counts = final_df.groupby('Tier')['Stock_ID'].nunique().to_dict()
         print(f"✅ 本批次 {len(target_stocks)} 檔存檔成功！全台股覆蓋率: {updated_total}/{len(all_stocks)} | 最新日期: {new_latest_date}")
         print(f"   📦 各層股票數: {tier_stock_counts}")
 
+        # 🔔 完美提醒！
         if len(needs_update) > MAX_STOCKS_PER_RUN:
             print(f"⏳ 本次 {MAX_STOCKS_PER_RUN} 檔已完美收工！為避免超過 API 每小時限制，請【休息 1 小時】後再執行下一批！")
     else:
@@ -394,7 +437,7 @@ if __name__ == "__main__":
     try:
         update_market_cache()
     finally:
-        # 確保幽靈暫存檔徹底清除
+        # ARCHITECTURE 1.2：程式結束時的最後防線，無論成功/失敗/無新資料，確保幽靈暫存檔徹底刪除
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
             print("🧹 程式結束，已確保中斷暫存檔被徹底清除。")
