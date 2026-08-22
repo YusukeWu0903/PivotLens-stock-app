@@ -30,7 +30,7 @@ MARKET_INDICES = ["TAIEX", "TPEx"]
 
 # 可配置參數
 MAX_WORKERS = int(os.getenv("UPDATE_MAX_WORKERS", "1"))
-MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "200"))
+MAX_STOCKS_PER_RUN = int(os.getenv("UPDATE_MAX_STOCKS_PER_RUN", "582"))
 CHECKPOINT_INTERVAL = int(os.getenv("UPDATE_CHECKPOINT_INTERVAL", "110"))
 REQUEST_DELAY = float(os.getenv("UPDATE_REQUEST_DELAY", "3.0"))
 # 單支 API 最大等待秒數 (防止卡死)
