@@ -49,9 +49,9 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
 
-          # 逐個加入，檔案不存在也不會報錯 (|| true)
+          # 逐個加入，檔案不存在也不會報錯
           git add market_cache/ || true
-          git add market_cache_checkpoint.parquet || true
+          [ -f market_cache_checkpoint.parquet ] && git add market_cache_checkpoint.parquet || true
           git add emerging_stocks.txt || true
           git add blacklist.txt || true
           git add stock_names.json || true
