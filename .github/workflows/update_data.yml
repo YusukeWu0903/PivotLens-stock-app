@@ -55,5 +55,6 @@ jobs:
           git add emerging_stocks.txt || true
           git add blacklist.txt || true
           git add stock_names.json || true
+          git add watchlist.txt || true
 
           git diff --quiet && git diff --staged --quiet || (git commit -m "auto: 每日定時更新市場快取 $(date +%F) [skip ci]" && git push)
