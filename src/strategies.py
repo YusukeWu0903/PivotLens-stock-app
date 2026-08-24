@@ -123,12 +123,25 @@ def calculate_historical_win_rate(
         (summary_dict, trade_logs_df) 或 (None, None) 若無樣本
     """
     df_calc = df.copy()
-    cross = (
-        (df_calc["MA_short"] > df_calc["MA_long"])
-        & (df_calc["MA_short"].shift(1) <= df_calc["MA_long"].shift(1))
-    )
-    order = df_calc["MA_short"] > df_calc["MA_long"]
-
+    
+    # 根據 signal_type 決定交叉方向、排列條件與勝率判定
+    if signal_type == "空方":
+        # 空方：死叉 + 空頭排列 (短均線 < 長均線)
+        cross = (
+            (df_calc["MA_short"] < df_calc["MA_long"])
+            & (df_calc["MA_short"].shift(1) >= df_calc["MA_long"].shift(1))
+        )
+        order = df_calc["MA_short"] < df_calc["MA_long"]
+        win_condition = lambda ret: ret < 0  # 做空獲利：價格下跌算贏
+    else:
+        # 多方：金叉 + 多頭排列 (短均線 > 長均線)
+        cross = (
+            (df_calc["MA_short"] > df_calc["MA_long"])
+            & (df_calc["MA_short"].shift(1) <= df_calc["MA_long"].shift(1))
+        )
+        order = df_calc["MA_short"] > df_calc["MA_long"]
+        win_condition = lambda ret: ret > 0  # 做多獲利：價格上漲算贏
+    
     recent_cross = cross.rolling(window=n_days).max() > 0
     price_near = (abs(df_calc["Close"] - df_calc["MA_long"]) / df_calc["MA_long"]) <= threshold
     signal_mask = recent_cross & order & price_near
@@ -158,7 +171,7 @@ def calculate_historical_win_rate(
                 future_price = df_calc["Close"].iloc[loc + hold_days]
                 ret = (future_price - entry_price) / entry_price
                 res[f"ret_{hold_days}d"] = ret
-                res[f"win_{hold_days}d"] = 1 if ret > 0 else 0
+                res[f"win_{hold_days}d"] = 1 if win_condition(ret) else 0
                 log_entry[i18n["log_exit_date"].format(days=hold_days)] = exit_date.strftime("%Y-%m-%d")
                 log_entry[i18n["log_ret"].format(days=hold_days)] = f"{round(ret * 100, 2)}%"
         if res:
