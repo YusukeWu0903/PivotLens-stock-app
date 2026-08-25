@@ -42,8 +42,9 @@ def render_kline_chart(
     # 重新計算該股票在該策略下的指標
     df_selected = process_timeframe_for_chart(df_raw, timeframe, short_ma, long_ma)
 
+    # 🎯 傳入 strategy_name 以支援多空雙向勝率計算
     stats, trade_logs_df = calculate_win_rate_for_chart(
-        df_selected, short_ma, long_ma, i18n
+        df_selected, short_ma, long_ma, strategy_name, i18n
     )
     latest_close = df_selected["Close"].iloc[-1]
     prev_close = df_selected["Close"].iloc[-2]
@@ -84,7 +85,6 @@ def render_kline_chart(
     st.divider()
 
     # ========== K 線圖繪製 ==========
-    # 先在全區間算好交叉訊號，再取 tail，避免被切斷導致 shift(1) 失真
     is_short_strategy = "空" in strategy_name or "死" in strategy_name
     df_selected["Golden_Cross"] = (
         (df_selected["MA_short"] > df_selected["MA_long"]) & 
@@ -139,7 +139,7 @@ def render_kline_chart(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3]
     )
 
-    # 價格軌跡 (透明線，用於 hover)
+    # 價格軌跡
     fig.add_trace(
         go.Scatter(
             x=x_vals,
@@ -198,17 +198,12 @@ def render_kline_chart(
         col=1,
     )
 
-    # ==========================================
     # 🎯 標註訊號箭頭 (在 K 線圖上疊加)
-    # ==========================================
     if not is_short_strategy:
-        # 畫黃金交叉 (紅色向上箭頭)
         df_golden = df_chart[df_chart["Golden_Cross"]]
         if not df_golden.empty:
             golden_x = df_golden["Date"].dt.strftime("%Y-%m-%d").tolist()
-            # Y 座標設在當天最低價的下方 (乘 0.98 微調，避免貼太近擋住K線)
             golden_y = df_golden["Low"] * 0.98
-            
             fig.add_trace(
                 go.Scatter(
                     x=golden_x,
@@ -222,13 +217,10 @@ def render_kline_chart(
                 col=1,
             )
     else:
-        # 畫死亡交叉 (綠色向下箭頭)
         df_death = df_chart[df_chart["Death_Cross"]]
         if not df_death.empty:
             death_x = df_death["Date"].dt.strftime("%Y-%m-%d").tolist()
-            # Y 座標設在當天最高價的上方 (乘 1.02 微調)
             death_y = df_death["High"] * 1.02
-            
             fig.add_trace(
                 go.Scatter(
                     x=death_x,
@@ -301,15 +293,12 @@ def process_timeframe_for_chart(
     long_ma: int
 ) -> pd.DataFrame:
     """為圖表處理時間框架與均線 (內部使用)"""
-    # 🛡️ 確保索引是 DatetimeIndex，並移除重複日期
     df_work = df.copy()
     if not isinstance(df_work.index, pd.DatetimeIndex):
         if "Date" in df_work.columns:
             df_work = df_work.set_index("Date")
         df_work.index = pd.to_datetime(df_work.index)
     df_work = df_work.sort_index()
-    
-    # 🛡️ 移除重複日期（保留最後一筆）
     df_work = df_work[~df_work.index.duplicated(keep='last')]
     
     if timeframe == "W":
@@ -333,25 +322,36 @@ def calculate_win_rate_for_chart(
     df: pd.DataFrame,
     short_ma: int,
     long_ma: int,
+    strategy_name: str,
     i18n: dict
 ) -> tuple[dict | None, pd.DataFrame | None]:
-    """為圖表計算勝率 (內部使用)"""
+    """為圖表計算勝率 (支援多空雙向)"""
     df_calc = df.copy()
     
-    # 🛡️ 防禦性修正：確保索引是 DatetimeIndex，避免 get_loc 回傳 slice
     if not isinstance(df_calc.index, pd.DatetimeIndex):
         if "Date" in df_calc.columns:
             df_calc = df_calc.set_index("Date")
         df_calc.index = pd.to_datetime(df_calc.index)
     df_calc = df_calc.sort_index()
-    # 🛡️ 移除重複日期（保留最後一筆）
     df_calc = df_calc[~df_calc.index.duplicated(keep='last')]
     
-    cross = (
-        (df_calc["MA_short"] > df_calc["MA_long"])
-        & (df_calc["MA_short"].shift(1) <= df_calc["MA_long"].shift(1))
-    )
-    order = df_calc["MA_short"] > df_calc["MA_long"]
+    # 🎯 判斷策略多空
+    is_short_strategy = "空" in strategy_name or "死" in strategy_name
+
+    if is_short_strategy:
+        # 📉 空方：死亡交叉 + 空頭排列
+        cross = (
+            (df_calc["MA_short"] < df_calc["MA_long"])
+            & (df_calc["MA_short"].shift(1) >= df_calc["MA_long"].shift(1))
+        )
+        order = df_calc["MA_short"] < df_calc["MA_long"]
+    else:
+        # 📈 多方：黃金交叉 + 多頭排列
+        cross = (
+            (df_calc["MA_short"] > df_calc["MA_long"])
+            & (df_calc["MA_short"].shift(1) <= df_calc["MA_long"].shift(1))
+        )
+        order = df_calc["MA_short"] > df_calc["MA_long"]
 
     recent_cross = cross.rolling(window=15).max() > 0
     price_near = (abs(df_calc["Close"] - df_calc["MA_long"]) / df_calc["MA_long"]) <= 0.04
@@ -364,7 +364,6 @@ def calculate_win_rate_for_chart(
         loc = df_calc.index.get_loc(date)
         if isinstance(loc, slice):
             loc = loc.start if loc.start is not None else 0
-        # 🛡️ 強制轉型為標量：確保 entry_price 非 Series
         entry_price_raw = df_calc.loc[date, "Close"]
         entry_price = float(entry_price_raw.iloc[0] if isinstance(entry_price_raw, pd.Series) else entry_price_raw)
         log_entry = {
@@ -376,11 +375,14 @@ def calculate_win_rate_for_chart(
             if loc + hold_days < len(df_calc):
                 exit_date = df_calc.index[loc + hold_days]
                 future_price_raw = df_calc["Close"].iloc[loc + hold_days]
-                # 🛡️ 強制轉型為標量：確保 future_price 非 Series
                 if isinstance(future_price_raw, pd.Series):
                     future_price_raw = future_price_raw.iloc[0]
                 future_price = float(future_price_raw)
-                ret = (future_price - entry_price) / entry_price
+                
+                # 🎯 多空勝率與報酬率修正：空方放空，股價下跌 (raw_ret < 0) 才是正報酬
+                raw_ret = (future_price - entry_price) / entry_price
+                ret = -raw_ret if is_short_strategy else raw_ret
+                
                 res[f"ret_{hold_days}d"] = ret
                 res[f"win_{hold_days}d"] = 1 if ret > 0 else 0
                 log_entry[i18n["log_exit_date"].format(days=hold_days)] = exit_date.strftime("%Y-%m-%d")
