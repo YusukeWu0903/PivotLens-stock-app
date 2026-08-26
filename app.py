@@ -46,7 +46,8 @@ def get_market_cache_key(cache_dir: str) -> str:
         return "0"
 
 
-@st.cache_data
+# 加上 ttl=3600 (3600秒 = 1小時)
+@st.cache_data(ttl=3600)
 def load_market_data(_cache_key: str):
     """載入市場資料並轉為字典引擎 (O(1) 查詢)"""
     try:
