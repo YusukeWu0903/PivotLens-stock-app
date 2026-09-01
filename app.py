@@ -48,7 +48,7 @@ def get_market_cache_key(cache_dir: str) -> str:
 
 # 加上 ttl=3600 (3600秒 = 1小時)
 @st.cache_data(ttl=3600)
-def load_market_data(_cache_key: str):
+def load_market_data(cache_key: str):
     """載入市場資料並轉為字典引擎 (O(1) 查詢)"""
     try:
         df = pd.read_parquet(CACHE_DIR)
@@ -65,9 +65,9 @@ def load_market_data(_cache_key: str):
         return {}
 
 
-# ⚡ 傳入最新修改時間當作 key，只要 Parquet 檔有變動就會自動重載
+# ⚡ 呼叫時一併修改參數名稱
 current_mtime_key = get_market_cache_key(CACHE_DIR)
-stock_dict = load_market_data(_cache_key=current_mtime_key)
+stock_dict = load_market_data(cache_key=current_mtime_key)
 
 if not stock_dict:
     st.warning(
@@ -85,8 +85,9 @@ def get_stock_name(stock_id):
 # ==========================================
 # 掃描器包裝函式 (帶快取)
 # ==========================================
-@st.cache_data
-def run_scanner_cached(_stock_dict, strategy_name):
+# 加上 ttl，並新增 cache_key 參數 (無底線)
+@st.cache_data(ttl=3600)
+def run_scanner_cached(_stock_dict, strategy_name, cache_key: str):
     """只快取「基礎大掃描」的結果，與 UI 條件脫鉤"""
     return run_market_scanner(
         stock_dict=_stock_dict,
@@ -164,6 +165,12 @@ if stock_dict:
 # 執行掃描與極速記憶體過濾
 # ==========================================
 with st.spinner(f"正在計算【{strategy_name}】全市場指標 (每日初次或切換策略時較久)..."):
+    # ⚡ 將 current_mtime_key 傳入，強制在資料更新時重跑掃描
+    raw_scan_df = run_scanner_cached(
+        _stock_dict=stock_dict, 
+        strategy_name=strategy_name,
+        cache_key=current_mtime_key
+    )
     # 這裡只傳入策略名稱，提取已算好的全市場 DataFrame
     raw_scan_df = run_scanner_cached(_stock_dict=stock_dict, strategy_name=strategy_name)
 
