@@ -26,7 +26,6 @@ st.caption(t["app_subtitle"])
 # 核心資料載入 (帶快取)
 # ==========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# 讀取新的分層快取目錄
 CACHE_DIR = os.path.join(BASE_DIR, "market_cache")
 
 
@@ -46,7 +45,7 @@ def get_market_cache_key(cache_dir: str) -> str:
         return "0"
 
 
-# 加上 ttl=3600 (3600秒 = 1小時)
+# 加上 ttl=3600 (1小時自動輪替)
 @st.cache_data(ttl=3600)
 def load_market_data(cache_key: str):
     """載入市場資料並轉為字典引擎 (O(1) 查詢)"""
@@ -65,7 +64,7 @@ def load_market_data(cache_key: str):
         return {}
 
 
-# ⚡ 呼叫時一併修改參數名稱
+# ⚡ 傳入時間戳金鑰，讓快取能精準追蹤變更
 current_mtime_key = get_market_cache_key(CACHE_DIR)
 stock_dict = load_market_data(cache_key=current_mtime_key)
 
@@ -85,10 +84,9 @@ def get_stock_name(stock_id):
 # ==========================================
 # 掃描器包裝函式 (帶快取)
 # ==========================================
-# 加上 ttl，並新增 cache_key 參數 (無底線)
 @st.cache_data(ttl=3600)
 def run_scanner_cached(_stock_dict, strategy_name, cache_key: str):
-    """只快取「基礎大掃描」的結果，與 UI 條件脫鉤"""
+    """只快取「基礎大掃描」的結果，當 cache_key 改變時自動重算"""
     return run_market_scanner(
         stock_dict=_stock_dict,
         strategy_name=strategy_name
@@ -131,7 +129,7 @@ price_range = st.sidebar.selectbox(
     index=0,
 )
 
-# 3. 依多空調整進場型態文案 (純粹二選一雙引擎)
+# 3. 依多空調整進場型態文案
 if not is_short:
     pattern_label = "買點型態"
     pattern_options = ["拉回支撐 (量縮潛伏)", "強勢創高 (帶量突破)"]
@@ -165,14 +163,12 @@ if stock_dict:
 # 執行掃描與極速記憶體過濾
 # ==========================================
 with st.spinner(f"正在計算【{strategy_name}】全市場指標 (每日初次或切換策略時較久)..."):
-    # ⚡ 將 current_mtime_key 傳入，強制在資料更新時重跑掃描
+    # ⚡ 精準傳入 current_mtime_key，檔案更新時自動發揮作用
     raw_scan_df = run_scanner_cached(
         _stock_dict=stock_dict, 
         strategy_name=strategy_name,
         cache_key=current_mtime_key
     )
-    # 這裡只傳入策略名稱，提取已算好的全市場 DataFrame
-    raw_scan_df = run_scanner_cached(_stock_dict=stock_dict, strategy_name=strategy_name)
 
 # ⚡ 開始零延遲 Pandas 記憶體過濾
 if raw_scan_df is not None and not raw_scan_df.empty:
@@ -188,17 +184,15 @@ if raw_scan_df is not None and not raw_scan_df.empty:
     # 2. 興櫃過濾
     if exclude_emerging:
         df_filtered = df_filtered[~df_filtered["Is_Emerging"]]
-
-    # 3. 雙引擎型態動態過濾 (二選一極簡邏輯)
+    
+    # 3. 雙引擎型態動態過濾
     if "強勢創高" in entry_pattern or "弱勢破底" in entry_pattern:
-        # 🚀 引擎二：動能追擊 (實質過前高/前低 + 收高/收低 + 出量)
         df_filtered = df_filtered[
             df_filtered["Support_Holds"] & 
             df_filtered["Momentum_Breakout"] & 
             df_filtered["Vol_Surge"]
         ]
     else:
-        # 🛡️ 引擎一：拉回支撐 / 反彈遇壓 (統一 0% ~ 8% 區間 + 守穩 + 量縮)
         df_filtered = df_filtered[
             df_filtered["Support_Holds"] & 
             df_filtered["Vol_Shrink"] & 
