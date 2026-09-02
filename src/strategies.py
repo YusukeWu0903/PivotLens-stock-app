@@ -20,7 +20,7 @@ def _load_emerging_stocks() -> set:
     global _EMERGING_STOCKS_CACHE
     if _EMERGING_STOCKS_CACHE is not None:
         return _EMERGING_STOCKS_CACHE
-    
+
     file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "emerging_stocks.txt")
     try:
         with open(file_path, "r") as f:
@@ -52,7 +52,7 @@ PATTERN_THRESHOLD_MAP = {
     "貼近均線 (量縮防守)": (0.00, 0.03),     # 引擎一
     "適度回測 (量縮洗盤)": (0.03, 0.08),     # 引擎一 (容忍稍微深一點的回測)
     "強勢創高 (帶量突破)": (0.10, 99.0),     # 引擎二 (解鎖乖離率上限)
-    
+
     # 📉 空方選項
     "貼近均線 (量縮遇壓)": (0.00, 0.03),     # 引擎一
     "適度反彈 (量縮測壓)": (0.03, 0.08),     # 引擎一
@@ -71,13 +71,13 @@ def process_timeframe_and_ma(
 ) -> pd.DataFrame:
     """
     根據指定週期進行重採樣與均線計算
-    
+
     Args:
         df: 原始日線資料 (需包含 Date index, Open, High, Low, Close, Volume)
         timeframe: "D" (日線) 或 "W" (周線)
         short_ma: 短均線週期
         long_ma: 長均線週期
-    
+
     Returns:
         處理後的 DataFrame (含 MA_short, MA_long, Vol_MA20)
     """
@@ -109,7 +109,7 @@ def calculate_historical_win_rate(
 ) -> tuple[dict | None, pd.DataFrame | None]:
     """
     計算歷史勝率與交易明細
-    
+
     Args:
         df: 已計算好均線的 DataFrame
         short_ma: 短均線週期
@@ -118,12 +118,12 @@ def calculate_historical_win_rate(
         n_days: 近期交叉天數窗口
         threshold: 均線容錯極限 (%)
         i18n: 語言包字典 (用於日誌欄位名稱)
-    
+
     Returns:
         (summary_dict, trade_logs_df) 或 (None, None) 若無樣本
     """
     df_calc = df.copy()
-    
+
     # 根據 signal_type 決定交叉方向、排列條件與勝率判定
     if signal_type == "空方":
         # 空方：死叉 + 空頭排列 (短均線 < 長均線)
@@ -141,7 +141,7 @@ def calculate_historical_win_rate(
         )
         order = df_calc["MA_short"] > df_calc["MA_long"]
         win_condition = lambda ret: ret > 0  # 做多獲利：價格上漲算贏
-    
+
     recent_cross = cross.rolling(window=n_days).max() > 0
     price_near = (abs(df_calc["Close"] - df_calc["MA_long"]) / df_calc["MA_long"]) <= threshold
     signal_mask = recent_cross & order & price_near
@@ -212,12 +212,16 @@ def run_market_scanner(
     is_short_strategy = "空" in strategy_name or "死" in strategy_name
 
     for stock_id, df_raw in stock_dict.items():
+        # 🚫 排除非 4 位數字代號 (指數、ETF、Food食品指數等非個股)
+        if not (str(stock_id).isdigit() and len(str(stock_id)) == 4):
+            continue
+
         lookback_bars = 350 if timeframe == "W" else 120
         df_slice = df_raw.tail(lookback_bars).copy()
 
         if len(df_slice) < 40:
             continue
-            
+
         latest_close = df_slice["Close"].iloc[-1]
         raw_avg_vol = (df_slice["Volume"] // 1000).tail(20).mean()
 
@@ -259,22 +263,22 @@ def run_market_scanner(
             recent_cross_signal = (golden_cross & (days_diff <= n_days)).any()
             ma_alignment = df["MA_short"].iloc[-1] > df["MA_long"].iloc[-1]
             ma_trend = current_ma_long > ma_long_prev
-            
+
             bias_rate = (close_price - current_ma_long) / current_ma_long
             support_holds = bias_rate >= -0.01  # 支撐不破
-            
+
             # 1. 抓取「昨天以前」近 20 日的最高價 (排除今天)
             prev_high_20 = df["High"].iloc[:-1].tail(20).max()
-            
+
             # 2. 實質突破：今日收盤價必須「大於等於」前 20 日最高價 (無折扣)
             is_real_breakout = close_price >= prev_high_20
-            
+
             # 3. K 棒實體強度：收盤價需位於今日高低振幅的上半部 60% 以上 (避免長上影線)
             day_range = df["High"].iloc[-1] - df["Low"].iloc[-1]
             is_strong_close = (close_price - df["Low"].iloc[-1]) >= (day_range * 0.6) if day_range > 0 else True
-            
+
             momentum_breakout = is_real_breakout and is_strong_close
-            
+
             # 4. 帶量判定：今日成交量需大於 20 日均量的 1.2 倍
             vol_surge = current_vol >= (vol_ma20 * 1.2)
             vol_shrink = current_vol <= (vol_ma20 * 1.5)
@@ -286,22 +290,22 @@ def run_market_scanner(
             recent_cross_signal = (death_cross & (days_diff <= n_days)).any()
             ma_alignment = df["MA_short"].iloc[-1] < df["MA_long"].iloc[-1]
             ma_trend = current_ma_long < ma_long_prev
-            
+
             bias_rate = (current_ma_long - close_price) / current_ma_long
             support_holds = bias_rate >= -0.01  # 壓力不破
-            
+
             # 抓取「昨天以前」近 20 日的最低價
             prev_low_20 = df["Low"].iloc[:-1].tail(20).min()
-            
+
             # 實質跌破：收盤價小於等於前 20 日最低價
             is_real_breakdown = close_price <= prev_low_20
-            
+
             # K 棒收在低點附近 (收在振幅下半部 40% 以下)
             day_range = df["High"].iloc[-1] - df["Low"].iloc[-1]
             is_weak_close = (close_price - df["Low"].iloc[-1]) <= (day_range * 0.4) if day_range > 0 else True
-            
+
             momentum_breakout = is_real_breakdown and is_weak_close
-            
+
             vol_surge = current_vol >= (vol_ma20 * 1.2)
             vol_shrink = current_vol <= (vol_ma20 * 1.5)
 
