@@ -19,3 +19,6 @@ sandbox_test_v2.py
 
 # 個人隱私設定或 API 金鑰
 .env
+
+# 更新中斷時的本地暫存檔
+market_cache_checkpoint.parquet

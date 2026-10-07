@@ -9,7 +9,7 @@ import pandas as pd
 
 # 專案模組
 from src.config_manager import get_strategy_config, get_strategy_names, I18N, get_stock_name_map
-from src.strategies import run_market_scanner
+from src.strategies import filter_scan_results, run_market_scanner
 from src.charts import render_kline_chart
 
 
@@ -52,6 +52,8 @@ def load_market_data(cache_key: str):
     try:
         df = pd.read_parquet(CACHE_DIR)
         df["Date"] = pd.to_datetime(df["Date"])
+        df["Stock_ID"] = df["Stock_ID"].astype(str)
+        df = df.drop_duplicates(subset=["Stock_ID", "Date"], keep="last")
 
         grouped = df.groupby("Stock_ID")
         stock_dict = {
@@ -133,11 +135,11 @@ price_range = st.sidebar.selectbox(
 if not is_short:
     pattern_label = "買點型態"
     pattern_options = ["拉回支撐 (量縮潛伏)", "強勢創高 (帶量突破)"]
-    pattern_help = "【拉回支撐】買在主力防守點：要求今日量縮，且股價回測長均線 (0~8%) 守穩不破。\n【強勢創高】追擊主升段：要求帶量實質過前高 (20日最高)，且尾盤強勢收高。"
+    pattern_help = "【拉回支撐】成交量低於 20 期均量，收盤價在長均線上方 0~8%。\n【強勢創高】成交量至少為 20 期均量 1.2 倍，收盤突破先前 20 期高點且收在當期較高位置。"
 else:
     pattern_label = "賣點/放空型態"
     pattern_options = ["反彈遇壓 (量縮潛伏)", "弱勢破底 (帶量下殺)"]
-    pattern_help = "【反彈遇壓】空在壓力防守點：要求今日量縮，且股價反彈至長均線 (0~8%) 受阻不破。\n【弱勢破底】追擊主跌段：要求帶量實質破前低 (20日最低)，且尾盤弱勢收低。"
+    pattern_help = "【反彈遇壓】成交量低於 20 期均量，收盤價在長均線下方 0~8%。\n【弱勢破底】成交量至少為 20 期均量 1.2 倍，收盤跌破先前 20 期低點且收在當期較低位置。"
 
 entry_pattern = st.sidebar.selectbox(
     pattern_label,
@@ -147,16 +149,20 @@ entry_pattern = st.sidebar.selectbox(
 )
 
 if stock_dict:
-    sample_stock = next(iter(stock_dict.values()))
-    latest_data_date = sample_stock.index[-1].strftime("%Y-%m-%d")
+    stock_latest_days = [group.index[-1].normalize() for group in stock_dict.values()]
+    latest_data_day = max(stock_latest_days)
+    latest_data_date = latest_data_day.strftime("%Y-%m-%d")
+    latest_stock_count = sum(day == latest_data_day for day in stock_latest_days)
 
     st.sidebar.divider()
     st.sidebar.markdown("### 📅 資料更新狀態")
     st.sidebar.caption(
-        f"• **當前數據日期**：`{latest_data_date}`\n\n"
-        f"• **首筆更新同步**：每日`17:00` 後\n\n"
-        f"• **全站更新同步**：每日`00:00`\n\n"
+        f"• **快取最新日期**：`{latest_data_date}`\n\n"
+        f"• **到達此日期**：`{latest_stock_count}/{len(stock_dict)}` 檔\n\n"
+        "• **預定更新**：17:35 起分 5 輪，至次日 01:35 啟動最後一輪；實際完成時間依排程與資料供應而定。"
     )
+    if (pd.Timestamp.today().normalize() - latest_data_day.normalize()).days > 7:
+        st.sidebar.warning("本機市場快取已超過 7 天未更新；選股結果請以資料日期為準。")
 
 
 # ==========================================
@@ -172,35 +178,9 @@ with st.spinner(f"正在計算【{strategy_name}】全市場指標 (每日初次
 
 # ⚡ 開始零延遲 Pandas 記憶體過濾
 if raw_scan_df is not None and not raw_scan_df.empty:
-    df_filtered = raw_scan_df.copy()
-
-    # 1. 流動性與價位過濾
-    df_filtered = df_filtered[df_filtered["20日均量(張)"] >= min_vol]
-    if price_range == "高價股(100元以上)":
-        df_filtered = df_filtered[df_filtered["最新收盤價"] >= 100]
-    else:
-        df_filtered = df_filtered[df_filtered["最新收盤價"] < 100]
-    
-    # 2. 興櫃過濾
-    if exclude_emerging:
-        df_filtered = df_filtered[~df_filtered["Is_Emerging"]]
-    
-    # 3. 雙引擎型態動態過濾
-    if "強勢創高" in entry_pattern or "弱勢破底" in entry_pattern:
-        df_filtered = df_filtered[
-            df_filtered["Support_Holds"] & 
-            df_filtered["Momentum_Breakout"] & 
-            df_filtered["Vol_Surge"]
-        ]
-    else:
-        df_filtered = df_filtered[
-            df_filtered["Support_Holds"] & 
-            df_filtered["Vol_Shrink"] & 
-            (df_filtered["Bias_Rate"] >= 0.00) & 
-            (df_filtered["Bias_Rate"] <= 0.08)
-        ]
-
-    scan_df = df_filtered
+    scan_df = filter_scan_results(
+        raw_scan_df, entry_pattern, min_vol, price_range, exclude_emerging
+    )
 else:
     scan_df = pd.DataFrame()
 
@@ -223,9 +203,9 @@ if scan_df is not None and not scan_df.empty:
             "" + chr(10) + chr(10) + ""
             "* **核心邏輯**：" + cfg['desc'] + ""
             "" + chr(10) + chr(10) + ""
-            "* **潛伏引擎 (拉回支撐 / 反彈遇壓)**：買在主力防守點。**量縮洗盤**，**股價回測均線 0~8% 內且守穩**，剔除爆量貫破支撐的接刀股。"
+            "* **潛伏引擎 (拉回支撐 / 反彈遇壓)**：買在主力防守點。成交量**低於 20 期均量**，股價在長均線同側 0~8% 內。"
             "" + chr(10) + chr(10) + ""
-            "* **動能引擎 (強勢創高 / 弱勢破底)**：追擊主升/主跌段。**突破過往 20 日高低點** + **K棒強勢收高/收低** + **帶量發動**，剔除假創高與高檔甩轎盤。"
+            "* **動能引擎 (強勢創高 / 弱勢破底)**：收盤突破過往 20 期高低點，K 棒收在有利方向，且成交量**至少為 20 期均量的 1.2 倍**。"
             "" + chr(10) + chr(10) + ""
             "* **過濾條件**：20 日均量 " + vol_text + " | 股價 " + price_text + " | 排除 20 日內頻繁交叉 3 次以上之均線糾結橫盤股。")
 
@@ -240,7 +220,8 @@ if scan_df is not None and not scan_df.empty:
     st.markdown(f"##### {t['select_stock_prompt']}")
 
     options = [
-        f"{row['股票代號']} - {get_stock_name(row['股票代號'])}{' (NEW)' if row['Is_New'] else ''}"
+        f"{row['股票代號']} - {get_stock_name(row['股票代號'])}"
+        f"｜資料 {row['資料日期']}{' (NEW)' if row['Is_New'] else ''}"
         for _, row in scan_df.iterrows()
     ]
 
@@ -252,7 +233,10 @@ if scan_df is not None and not scan_df.empty:
 
     if selected_stock:
         stock_id = selected_stock.split(" - ")[0].strip()
-        render_kline_chart(stock_id, strategy_name, stock_dict, stock_name_map, t)
+        render_kline_chart(
+            stock_id, strategy_name, stock_dict, stock_name_map, t,
+            entry_pattern, min_vol, price_range, exclude_emerging,
+        )
 
 else:
     st.info("ℹ️ 當前條件下未找到符合策略之股票，請嘗試切換其他股價區間或買點型態。")

@@ -9,6 +9,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from src.strategies import calculate_screen_win_rate
 
 
 def render_kline_chart(
@@ -16,7 +17,11 @@ def render_kline_chart(
     strategy_name: str,
     stock_dict: dict,
     stock_name_map: dict,
-    i18n: dict
+    i18n: dict,
+    entry_pattern: str,
+    min_volume_sheets: int,
+    price_range: str,
+    exclude_emerging: bool,
 ) -> None:
     """
     渲染單一股票的 K 線圖、勝率統計、技術診斷
@@ -43,8 +48,9 @@ def render_kline_chart(
     df_selected = process_timeframe_for_chart(df_raw, timeframe, short_ma, long_ma)
 
     # 🎯 傳入 strategy_name 以支援多空雙向勝率計算
-    stats, trade_logs_df = calculate_win_rate_for_chart(
-        df_selected, short_ma, long_ma, strategy_name, i18n
+    stats, trade_logs_df = calculate_screen_win_rate(
+        df_raw, stock_id, strategy_name, entry_pattern, min_volume_sheets,
+        price_range, exclude_emerging, i18n,
     )
     latest_close = df_selected["Close"].iloc[-1]
     prev_close = df_selected["Close"].iloc[-2]
@@ -57,11 +63,19 @@ def render_kline_chart(
     col_stat, col_diag = st.columns([1, 1])
     with col_stat:
         st.markdown(f"##### {i18n['win_rate_header']}")
-        if stats and "win_rate_5d" in stats:
+        if stats:
             m1, m2, m3 = st.columns(3)
-            m1.metric(i18n["win_rate_5d"], f"{stats.get('win_rate_5d', 0)}%", f"{stats.get('avg_ret_5d', 0)}%")
-            m2.metric(i18n["win_rate_10d"], f"{stats.get('win_rate_10d', 0)}%", f"{stats.get('avg_ret_10d', 0)}%")
-            m3.metric(i18n["win_rate_20d"], f"{stats.get('win_rate_20d', 0)}%", f"{stats.get('avg_ret_20d', 0)}%")
+            unit = "週" if timeframe == "W" else "日"
+            for column, hold_bars in zip((m1, m2, m3), (5, 10, 20)):
+                label = f"{hold_bars}{unit}勝率"
+                if stats.get(f"samples_{hold_bars}d", 0):
+                    column.metric(
+                        label, f"{stats[f'win_rate_{hold_bars}d']}%",
+                        f"平均報酬 {stats[f'avg_ret_{hold_bars}d']}%",
+                    )
+                    column.caption(f"已結算 {stats[f'samples_{hold_bars}d']} 筆")
+                else:
+                    column.metric(label, "樣本不足")
             st.caption(i18n["signals_count_msg"].format(count=stats["total_signals"]))
         else:
             st.info(i18n["no_sample_msg"])
@@ -316,88 +330,3 @@ def process_timeframe_for_chart(
     df_resampled["MA_long"] = df_resampled["Close"].rolling(window=long_ma).mean()
     df_resampled["Vol_MA20"] = df_resampled["Volume"].rolling(window=20).mean()
     return df_resampled
-
-
-def calculate_win_rate_for_chart(
-    df: pd.DataFrame,
-    short_ma: int,
-    long_ma: int,
-    strategy_name: str,
-    i18n: dict
-) -> tuple[dict | None, pd.DataFrame | None]:
-    """為圖表計算勝率 (支援多空雙向)"""
-    df_calc = df.copy()
-    
-    if not isinstance(df_calc.index, pd.DatetimeIndex):
-        if "Date" in df_calc.columns:
-            df_calc = df_calc.set_index("Date")
-        df_calc.index = pd.to_datetime(df_calc.index)
-    df_calc = df_calc.sort_index()
-    df_calc = df_calc[~df_calc.index.duplicated(keep='last')]
-    
-    # 🎯 判斷策略多空
-    is_short_strategy = "空" in strategy_name or "死" in strategy_name
-
-    if is_short_strategy:
-        # 📉 空方：死亡交叉 + 空頭排列
-        cross = (
-            (df_calc["MA_short"] < df_calc["MA_long"])
-            & (df_calc["MA_short"].shift(1) >= df_calc["MA_long"].shift(1))
-        )
-        order = df_calc["MA_short"] < df_calc["MA_long"]
-    else:
-        # 📈 多方：黃金交叉 + 多頭排列
-        cross = (
-            (df_calc["MA_short"] > df_calc["MA_long"])
-            & (df_calc["MA_short"].shift(1) <= df_calc["MA_long"].shift(1))
-        )
-        order = df_calc["MA_short"] > df_calc["MA_long"]
-
-    recent_cross = cross.rolling(window=15).max() > 0
-    price_near = (abs(df_calc["Close"] - df_calc["MA_long"]) / df_calc["MA_long"]) <= 0.04
-    signal_mask = recent_cross & order & price_near
-    entry_signals = signal_mask & (~signal_mask.shift(1).fillna(False))
-    signal_dates = df_calc[entry_signals].index
-
-    results, trade_logs = [], []
-    for date in signal_dates:
-        loc = df_calc.index.get_loc(date)
-        if isinstance(loc, slice):
-            loc = loc.start if loc.start is not None else 0
-        entry_price_raw = df_calc.loc[date, "Close"]
-        entry_price = float(entry_price_raw.iloc[0] if isinstance(entry_price_raw, pd.Series) else entry_price_raw)
-        log_entry = {
-            i18n["log_entry_date"]: date.strftime("%Y-%m-%d"),
-            i18n["log_entry_price"]: round(entry_price, 2),
-        }
-        res = {}
-        for hold_days in [5, 10, 20]:
-            if loc + hold_days < len(df_calc):
-                exit_date = df_calc.index[loc + hold_days]
-                future_price_raw = df_calc["Close"].iloc[loc + hold_days]
-                if isinstance(future_price_raw, pd.Series):
-                    future_price_raw = future_price_raw.iloc[0]
-                future_price = float(future_price_raw)
-                
-                # 🎯 多空勝率與報酬率修正：空方放空，股價下跌 (raw_ret < 0) 才是正報酬
-                raw_ret = (future_price - entry_price) / entry_price
-                ret = -raw_ret if is_short_strategy else raw_ret
-                
-                res[f"ret_{hold_days}d"] = ret
-                res[f"win_{hold_days}d"] = 1 if ret > 0 else 0
-                log_entry[i18n["log_exit_date"].format(days=hold_days)] = exit_date.strftime("%Y-%m-%d")
-                log_entry[i18n["log_ret"].format(days=hold_days)] = f"{round(ret * 100, 2)}%"
-        if res:
-            results.append(res)
-            trade_logs.append(log_entry)
-
-    if not results:
-        return None, None
-
-    df_res, df_logs = pd.DataFrame(results), pd.DataFrame(trade_logs)
-    summary = {"total_signals": len(df_res)}
-    for hold_days in [5, 10, 20]:
-        if f"win_{hold_days}d" in df_res.columns:
-            summary[f"win_rate_{hold_days}d"] = round(df_res[f"win_{hold_days}d"].mean() * 100, 1)
-            summary[f"avg_ret_{hold_days}d"] = round(df_res[f"ret_{hold_days}d"].mean() * 100, 2)
-    return summary, df_logs

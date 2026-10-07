@@ -44,20 +44,47 @@ def is_emerging_stock(stock_id: str) -> bool:
 
 
 # ==========================================
-# 買點/賣點型態區間映射：(min_thresh, max_thresh) 互斥區間
-# 💡 當 max_thresh >= 0.10 時，系統將自動啟動「引擎二：動能追擊」
+# 量價門檻與畫面篩選共用規則
 # ==========================================
-PATTERN_THRESHOLD_MAP = {
-    # 📈 多方選項
-    "貼近均線 (量縮防守)": (0.00, 0.03),     # 引擎一
-    "適度回測 (量縮洗盤)": (0.03, 0.08),     # 引擎一 (容忍稍微深一點的回測)
-    "強勢創高 (帶量突破)": (0.10, 99.0),     # 引擎二 (解鎖乖離率上限)
+VOLUME_SHRINK_RATIO = 1.0
+VOLUME_SURGE_RATIO = 1.2
 
-    # 📉 空方選項
-    "貼近均線 (量縮遇壓)": (0.00, 0.03),     # 引擎一
-    "適度反彈 (量縮測壓)": (0.03, 0.08),     # 引擎一
-    "弱勢破底 (帶量下殺)": (0.10, 99.0),     # 引擎二 (解鎖乖離率上限)
-}
+
+def filter_scan_results(
+    scan_df: pd.DataFrame,
+    entry_pattern: str,
+    min_volume_sheets: int,
+    price_range: str,
+    exclude_emerging: bool,
+) -> pd.DataFrame:
+    """Apply the same visible filters to today's scan and historical signals."""
+    if scan_df.empty:
+        return scan_df.copy()
+
+    filtered = scan_df[scan_df["20日均量(張)"] >= min_volume_sheets]
+    if price_range == "高價股(100元以上)":
+        filtered = filtered[filtered["最新收盤價"] >= 100]
+    elif price_range == "低價股(100元以下)":
+        filtered = filtered[filtered["最新收盤價"] < 100]
+    else:
+        raise ValueError(f"未知的股價區間: {price_range}")
+
+    if exclude_emerging:
+        filtered = filtered[~filtered["Is_Emerging"]]
+
+    if "強勢創高" in entry_pattern or "弱勢破底" in entry_pattern:
+        return filtered[
+            filtered["Support_Holds"]
+            & filtered["Momentum_Breakout"]
+            & filtered["Vol_Surge"]
+        ].copy()
+    if "拉回支撐" in entry_pattern or "反彈遇壓" in entry_pattern:
+        return filtered[
+            filtered["Support_Holds"]
+            & filtered["Vol_Shrink"]
+            & filtered["Bias_Rate"].between(0.0, 0.08)
+        ].copy()
+    raise ValueError(f"未知的買賣點型態: {entry_pattern}")
 
 
 # ==========================================
@@ -145,7 +172,7 @@ def calculate_historical_win_rate(
     recent_cross = cross.rolling(window=n_days).max() > 0
     price_near = (abs(df_calc["Close"] - df_calc["MA_long"]) / df_calc["MA_long"]) <= threshold
     signal_mask = recent_cross & order & price_near
-    entry_signals = signal_mask & (~signal_mask.shift(1).fillna(False))
+    entry_signals = signal_mask & (~signal_mask.shift(1, fill_value=False))
     signal_dates = df_calc[entry_signals].index
 
     if i18n is None:
@@ -279,10 +306,6 @@ def run_market_scanner(
 
             momentum_breakout = is_real_breakout and is_strong_close
 
-            # 4. 帶量判定：今日成交量需大於 20 日均量的 1.2 倍
-            vol_surge = current_vol >= (vol_ma20 * 1.2)
-            vol_shrink = current_vol <= (vol_ma20 * 1.5)
-
         else:
             # ==========================================
             # 📉 做空破底邏輯
@@ -306,15 +329,12 @@ def run_market_scanner(
 
             momentum_breakout = is_real_breakdown and is_weak_close
 
-            vol_surge = current_vol >= (vol_ma20 * 1.2)
-            vol_shrink = current_vol <= (vol_ma20 * 1.5)
-
         # 基礎門檻：連訊號或趨勢都沒有的，直接淘汰以省記憶體
         if not (recent_cross_signal and ma_alignment and ma_trend):
             continue
 
-        vol_shrink = current_vol <= (vol_ma20 * 1.5)
-        vol_surge = current_vol >= (vol_ma20 * 0.8)
+        vol_shrink = current_vol < (vol_ma20 * VOLUME_SHRINK_RATIO)
+        vol_surge = current_vol >= (vol_ma20 * VOLUME_SURGE_RATIO)
 
         # 判定是否為 3 天內新訊號
         cross_mask = death_cross if is_short_strategy else golden_cross
@@ -344,3 +364,101 @@ def run_market_scanner(
         })
 
     return pd.DataFrame(results)
+
+
+def calculate_screen_win_rate(
+    df_raw: pd.DataFrame,
+    stock_id: str,
+    strategy_name: str,
+    entry_pattern: str,
+    min_volume_sheets: int,
+    price_range: str,
+    exclude_emerging: bool,
+    i18n: dict,
+) -> tuple[dict | None, pd.DataFrame | None]:
+    """Replay the selected screen at each historical close over the last year.
+
+    Consecutive matching bars form one entry. Returns are measured after 5, 10,
+    and 20 trading bars for daily strategies or completed weekly bars for weekly
+    strategies. An entry contributes only to horizons with a known exit price.
+    """
+    from src.config_manager import get_strategy_config
+
+    cfg = get_strategy_config(strategy_name)
+    daily = df_raw.copy()
+    if not isinstance(daily.index, pd.DatetimeIndex):
+        daily.index = pd.to_datetime(daily.index)
+    daily = daily.sort_index()
+    daily = daily[~daily.index.duplicated(keep="last")]
+    if daily.empty:
+        return None, None
+
+    if cfg["timeframe"] == "W":
+        candidate_dates = daily.groupby(pd.Grouper(freq="W-FRI")).tail(1).index
+        unit = "週"
+    else:
+        candidate_dates = daily.index
+        unit = "日"
+
+    cutoff = daily.index[-1] - pd.Timedelta(days=365)
+    first_recent = candidate_dates.searchsorted(cutoff)
+    if first_recent == len(candidate_dates):
+        return None, None
+
+    # Replay one bar before the window so an existing matching run is not
+    # incorrectly counted as a new entry at the one-year boundary.
+    replay_start = max(0, first_recent - 1)
+    previous_match = False
+    entries = []
+    for candidate_index in range(replay_start, len(candidate_dates)):
+        date = candidate_dates[candidate_index]
+        daily_position = daily.index.get_loc(date)
+        snapshot = run_market_scanner(
+            {str(stock_id): daily.iloc[:daily_position + 1]}, strategy_name
+        )
+        match = not filter_scan_results(
+            snapshot, entry_pattern, min_volume_sheets, price_range,
+            exclude_emerging,
+        ).empty
+        if candidate_index >= first_recent and match and not previous_match:
+            entries.append(candidate_index)
+        previous_match = match
+
+    if not entries:
+        return None, None
+
+    closes = daily.loc[candidate_dates, "Close"]
+    is_short = "空" in strategy_name or "死" in strategy_name
+    summary = {"total_signals": len(entries)}
+    logs = []
+    horizon_results = {5: [], 10: [], 20: []}
+    for entry_index in entries:
+        entry_date = candidate_dates[entry_index]
+        entry_price = float(closes.iloc[entry_index])
+        log = {
+            i18n["log_entry_date"]: entry_date.strftime("%Y-%m-%d"),
+            i18n["log_entry_price"]: round(entry_price, 2),
+        }
+        for hold_bars in horizon_results:
+            exit_index = entry_index + hold_bars
+            if exit_index >= len(candidate_dates):
+                continue
+            exit_price = float(closes.iloc[exit_index])
+            ret = (exit_price - entry_price) / entry_price
+            if is_short:
+                ret = -ret
+            horizon_results[hold_bars].append(ret)
+            log[f"{hold_bars}{unit}後結算日"] = candidate_dates[exit_index].strftime("%Y-%m-%d")
+            log[f"{hold_bars}{unit}報酬(%)"] = f"{ret * 100:.2f}%"
+        logs.append(log)
+
+    for hold_bars, returns in horizon_results.items():
+        summary[f"samples_{hold_bars}d"] = len(returns)
+        if returns:
+            summary[f"win_rate_{hold_bars}d"] = round(
+                sum(ret > 0 for ret in returns) / len(returns) * 100, 1
+            )
+            summary[f"avg_ret_{hold_bars}d"] = round(
+                sum(returns) / len(returns) * 100, 2
+            )
+    return summary, pd.DataFrame(logs)

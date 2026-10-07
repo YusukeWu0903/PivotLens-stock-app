@@ -1,8 +1,10 @@
 import os
 import time
 import json
+import threading
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dotenv import load_dotenv
 from FinMind.data import DataLoader
@@ -40,6 +42,28 @@ TEMP_BLACKLIST_DAYS = int(os.getenv("TEMP_BLACKLIST_DAYS", "30"))
 # 熔斷器參數
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "3"))
 CIRCUIT_BREAKER_WAIT = int(os.getenv("CIRCUIT_BREAKER_WAIT", "60"))
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+_request_lock = threading.Lock()
+_next_request_at = 0.0
+
+
+def wait_for_request_slot() -> None:
+    """Space API calls across all workers instead of sleeping after results."""
+    global _next_request_at
+    with _request_lock:
+        remaining = _next_request_at - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        _next_request_at = time.monotonic() + REQUEST_DELAY
+
+
+def get_target_market_date(now: datetime | None = None) -> date:
+    """Target the latest completed Taiwan market day, including overnight runs."""
+    taipei_now = now.astimezone(TAIPEI_TZ) if now is not None else datetime.now(TAIPEI_TZ)
+    target = taipei_now.date() if taipei_now.hour >= 17 else taipei_now.date() - timedelta(days=1)
+    while target.weekday() >= 5:
+        target -= timedelta(days=1)
+    return target
 
 
 def fetch_single_stock_daily(dl: DataLoader, stock_id: str, start_date: str, end_date: str) -> pd.DataFrame | None:
@@ -48,6 +72,7 @@ def fetch_single_stock_daily(dl: DataLoader, stock_id: str, start_date: str, end
     回傳 DataFrame 或 None（失敗）。
     """
     try:
+        wait_for_request_slot()
         df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_date, end_date=end_date)
         if not df.empty:
             return df
@@ -140,12 +165,14 @@ def smart_blacklist_manager(dl: DataLoader) -> set:
 
     # ========== L2: 載入暫時黑名單 (含時間戳，過期自動清除) ==========
     temp_updated = []
+    temp_original_count = 0
     if os.path.exists(TEMP_BLACKLIST_FILE):
         with open(TEMP_BLACKLIST_FILE, "r") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
+                temp_original_count += 1
                 parts = line.split(",")
                 if len(parts) == 2:
                     sid, ts_str = parts
@@ -158,20 +185,30 @@ def smart_blacklist_manager(dl: DataLoader) -> set:
                         continue
 
     # 寫回 (自動清除過期條目)
-    if len(temp_updated) != len([l for l in open(TEMP_BLACKLIST_FILE) if l.strip()]):
+    if len(temp_updated) != temp_original_count:
         with open(TEMP_BLACKLIST_FILE, "w") as f:
             for line in temp_updated:
                 f.write(line + "\n")
 
-    # ========== L3: 主動偵測官方下市股 (FinMind 官方標記) ==========
+    # ========== L3: 只將確認下市／終止上市的股票永久封鎖 ==========
     try:
         df_info = dl.taiwan_stock_info()
-        # 官方 type 包含下市、終止上市、暫停交易等
-        delisted_candidates = df_info[
-            df_info['type'].isin(['delisted', 'terminated', 'suspended'])
-        ]['stock_id'].astype(str).tolist()
+        delisted_candidates = set(df_info[
+            df_info['type'].isin(['delisted', 'terminated'])
+        ]['stock_id'].astype(str))
+        suspended = set(df_info[
+            df_info['type'] == 'suspended'
+        ]['stock_id'].astype(str))
+        # 舊版曾將 suspended 寫入永久黑名單；依目前官方狀態移除。
+        wrongly_blocked = (permanent & suspended) - delisted_candidates
+        if wrongly_blocked:
+            permanent.difference_update(wrongly_blocked)
+            with open(BLACKLIST_FILE, "w") as f:
+                for sid in sorted(permanent):
+                    f.write(f"{sid}\n")
+            print(f"♻️ 已將 {len(wrongly_blocked)} 檔暫停交易股票移出永久黑名單")
         # 加入永久封鎖 (只加新的)
-        new_delisted = set(delisted_candidates) - permanent
+        new_delisted = delisted_candidates - permanent
         if new_delisted:
             permanent.update(new_delisted)
             with open(BLACKLIST_FILE, "a") as f:
@@ -194,14 +231,9 @@ def update_market_cache():
     dl = DataLoader()
     dl.login_by_token(api_token=FINMIND_TOKEN)
 
-    # 📌 週末防呆機制
-    now = datetime.now()
-    if now.weekday() == 5:
-        now = now - timedelta(days=1)
-    elif now.weekday() == 6:
-        now = now - timedelta(days=2)
-
-    today_str = now.strftime('%Y-%m-%d')
+    # 依台灣時間鎖定最新已收盤交易日，隔日凌晨補抓仍對準前一日。
+    target_market_date = get_target_market_date()
+    today_str = target_market_date.isoformat()
     today_ts = pd.to_datetime(today_str)
 
     print("⏳ 正在獲取全台股清單...")
@@ -256,7 +288,7 @@ def update_market_cache():
 
     if existing_df.empty:
         needs_update = all_stocks
-        default_start = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+        default_start = (target_market_date - timedelta(days=365)).isoformat()
         for sid in all_stocks:
             fetch_tasks[sid] = default_start
     else:
@@ -264,7 +296,7 @@ def update_market_cache():
         for sid in all_stocks:
             if sid not in latest_dates:
                 needs_update.append(sid)
-                fetch_tasks[sid] = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+                fetch_tasks[sid] = (target_market_date - timedelta(days=365)).isoformat()
             else:
                 stock_latest = latest_dates[sid]
                 if stock_latest < today_ts:
@@ -362,7 +394,6 @@ def update_market_cache():
 
                 if completed % 50 == 0 or completed == len(target_stocks):
                     print(f"⏳ 進度: {completed}/{len(target_stocks)}")
-                time.sleep(REQUEST_DELAY)
 
         # 迴圈正常結束 (pending 為空)，不需要額外處理
 

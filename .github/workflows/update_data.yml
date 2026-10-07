@@ -8,8 +8,10 @@ on:
     - cron: '35 11 * * 1-5'
     # 3. 台灣時間 21:35 (UTC 13:35) -> 第 3 批 (1165 ~ 1746 檔)
     - cron: '35 13 * * 1-5'
-    # 4. 台灣時間 23:35 (UTC 15:35) -> 第 4 批 (補漏，確保 100% 覆蓋)
+    # 4. 台灣時間 23:35 (UTC 15:35) -> 第 4 批
     - cron: '35 15 * * 1-5'
+    # 5. 台灣時間次日 01:35 (UTC 17:35) -> 第 5 批 (補足股票池容量)
+    - cron: '35 17 * * 1-5'
 
   workflow_dispatch: # 保留手動按鈕
 
@@ -19,7 +21,7 @@ permissions:
 jobs:
   update-data:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: 📥 簽出程式碼 (Checkout repository)
         uses: actions/checkout@v4
@@ -51,7 +53,8 @@ jobs:
 
           # 逐個加入，檔案不存在也不會報錯
           git add market_cache/ || true
-          [ -f market_cache_checkpoint.parquet ] && git add market_cache_checkpoint.parquet || true
+          # 暫存檔只供本次執行復原；舊版曾追蹤它，需將刪除記錄納入提交。
+          git add -u -- market_cache_checkpoint.parquet || true
           git add emerging_stocks.txt || true
           git add blacklist.txt || true
           git add stock_names.json || true
