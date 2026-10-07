@@ -21,6 +21,15 @@ st.set_page_config(page_title=t["page_title"], page_icon="📈", layout="wide")
 st.title(t["app_title"])
 st.caption(t["app_subtitle"])
 
+# 依版本檔顯示人工整理的功能報告；最新變更放在最上方。
+with st.expander("🛠️ 開發日誌｜最新功能與修正", expanded=False):
+    changelog_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CHANGELOG.md")
+    try:
+        with open(changelog_path, encoding="utf-8") as log_file:
+            st.markdown(log_file.read())
+    except FileNotFoundError:
+        st.info("目前尚無開發日誌。")
+
 
 # ==========================================
 # 核心資料載入 (帶快取)

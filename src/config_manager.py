@@ -80,10 +80,17 @@ def get_strategy_config(strategy_name: str | None = None) -> dict:
     return STRATEGY_CONFIG.get(strategy_name, {})
 
 
+# 暫時從畫面隱藏長多；保留參數與運算邏輯，方便日後重新開放。
+TEMPORARILY_HIDDEN_STRATEGIES = {"長多 (周K 13MA + 52MA)"}
+
+
 def get_strategy_names(is_short: bool = False) -> list[str]:
-    """取得策略名稱列表，可依據做多/做空過濾"""
+    """取得目前開放的策略名稱，可依做多/做空方向過濾。"""
     keyword = "空" if is_short else "多"
-    return [name for name in STRATEGY_CONFIG.keys() if keyword in name]
+    return [
+        name for name in STRATEGY_CONFIG
+        if keyword in name and name not in TEMPORARILY_HIDDEN_STRATEGIES
+    ]
 
 
 def validate_strategy_params(params: dict) -> bool:
