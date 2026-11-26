@@ -43,6 +43,10 @@ TEMP_BLACKLIST_DAYS = int(os.getenv("TEMP_BLACKLIST_DAYS", "30"))
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "3"))
 CIRCUIT_BREAKER_WAIT = int(os.getenv("CIRCUIT_BREAKER_WAIT", "60"))
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+TWSE_DAILY_MARKET_URLS = (
+    "https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK",
+    "https://www.twse.com.tw/exchangeReport/FMTQIK",
+)
 _request_lock = threading.Lock()
 _next_request_at = 0.0
 
@@ -57,13 +61,60 @@ def wait_for_request_slot() -> None:
         _next_request_at = time.monotonic() + REQUEST_DELAY
 
 
-def get_target_market_date(now: datetime | None = None) -> date:
-    """Target the latest completed Taiwan market day, including overnight runs."""
+def market_date_cutoff(now: datetime | None = None) -> date:
     taipei_now = now.astimezone(TAIPEI_TZ) if now is not None else datetime.now(TAIPEI_TZ)
-    target = taipei_now.date() if taipei_now.hour >= 17 else taipei_now.date() - timedelta(days=1)
-    while target.weekday() >= 5:
-        target -= timedelta(days=1)
-    return target
+    return taipei_now.date() if taipei_now.hour >= 17 else taipei_now.date() - timedelta(days=1)
+
+
+def fetch_twse_session_dates(query_day: date) -> set[date]:
+    """Read completed sessions from the official monthly market summary."""
+    for url in TWSE_DAILY_MARKET_URLS:
+        try:
+            response = requests.get(
+                url,
+                params={"date": query_day.strftime("%Y%m%d"), "response": "json"},
+                headers={"Accept": "application/json", "Cache-Control": "no-cache"},
+                timeout=10,
+            )
+            response.raise_for_status()
+            return parse_twse_sessions(response.json(), query_day)
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+    raise ValueError(f"無法讀取證交所市場成交資訊：{last_error}") from last_error
+
+
+def parse_twse_sessions(payload, query_day: date) -> set[date]:
+    if not isinstance(payload, dict):
+        raise ValueError("證交所市場成交資訊格式不符")
+
+    status = payload.get("stat")
+    rows = payload.get("data")
+    if not rows and isinstance(status, str) and status.startswith("很抱歉，沒有符合條件的資料"):
+        return set()
+    if status != "OK" or not isinstance(rows, list) or not rows:
+        raise ValueError(f"無法確認證交所交易日期：{status}")
+
+    sessions = set()
+    for row in rows:
+        if not isinstance(row, list) or not row or not isinstance(row[0], str):
+            raise ValueError("證交所市場成交資訊缺少日期")
+        year, month_number, day = map(int, row[0].split("/"))
+        session = date(year + 1911, month_number, day)
+        if (session.year, session.month) != (query_day.year, query_day.month):
+            raise ValueError("證交所回傳月份與查詢月份不符")
+        sessions.add(session)
+    return sessions
+
+
+def get_target_market_date(now: datetime | None = None) -> date:
+    """Use the last published session, not an assumed weekday."""
+    cutoff = market_date_cutoff(now)
+    previous_month_end = cutoff.replace(day=1) - timedelta(days=1)
+    for period in (cutoff, previous_month_end):
+        sessions = [day for day in fetch_twse_session_dates(period) if day <= cutoff]
+        if sessions:
+            return max(sessions)
+    raise ValueError("近兩個月份沒有可確認的交易日")
 
 
 def fetch_single_stock_daily(dl: DataLoader, stock_id: str, start_date: str, end_date: str) -> pd.DataFrame | None:
@@ -227,12 +278,22 @@ def update_market_cache():
         print("❌ 錯誤：未在 .env 中找到 FINMIND_TOKEN，請檢查設定。")
         return
 
-    # 🔑 關鍵優化：主執行緒只建立一次 DataLoader 並完成登入
+    # 先確認盤後交易日期。官方來源異常時保留既有快取，不逐檔猜測。
+    now = datetime.now(TAIPEI_TZ)
+    cutoff = market_date_cutoff(now)
+    try:
+        target_market_date = get_target_market_date(now)
+    except (requests.RequestException, ValueError) as exc:
+        print(f"⚠️ 無法確認交易日，本批保留既有行情、等待下批重試：{exc}")
+        return
+
+    if target_market_date < cutoff:
+        print(f"ℹ️ {cutoff} 尚無已確認的盤後行情；只補抓至 {target_market_date}。")
+
+    # 共用同一個 FinMind DataLoader，避免每檔重新登入。
     dl = DataLoader()
     dl.login_by_token(api_token=FINMIND_TOKEN)
 
-    # 依台灣時間鎖定最新已收盤交易日，隔日凌晨補抓仍對準前一日。
-    target_market_date = get_target_market_date()
     today_str = target_market_date.isoformat()
     today_ts = pd.to_datetime(today_str)
 
@@ -398,7 +459,9 @@ def update_market_cache():
         # 迴圈正常結束 (pending 為空)，不需要額外處理
 
     # ========== 失敗記錄到觀察清單 (不封鎖) ==========
-    if failed_stocks:
+    if failed_stocks and target_market_date < cutoff:
+        print("ℹ️ 本批僅補抓較早行情，未取得的標的不寫入觀察清單。")
+    elif failed_stocks:
         print(f"⚠️ 本批次失敗 {len(failed_stocks)} 檔: {failed_stocks[:10]}... 將記錄到觀察清單，留待下一輪排程補抓")
         try:
             with open(WATCHLIST_FILE, "a") as f:
