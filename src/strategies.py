@@ -56,6 +56,7 @@ def filter_scan_results(
     min_volume_sheets: int,
     price_range: str,
     exclude_emerging: bool,
+    *, watch_only: bool = False,
 ) -> pd.DataFrame:
     """Apply the same visible filters to today's scan and historical signals."""
     if scan_df.empty:
@@ -78,7 +79,12 @@ def filter_scan_results(
             & filtered["Momentum_Breakout"]
             & filtered["Vol_Surge"]
         ].copy()
-    if "拉回支撐" in entry_pattern or "反彈遇壓" in entry_pattern:
+    if "拉回支撐" in entry_pattern:
+        state = "觀察中" if watch_only else "正式入選"
+        return filtered[filtered["Pullback_State"] == state].copy()
+    if watch_only:
+        return filtered.iloc[0:0].copy()
+    if "反彈遇壓" in entry_pattern:
         return filtered[
             filtered["Support_Holds"]
             & filtered["Vol_Shrink"]
@@ -215,6 +221,30 @@ def calculate_historical_win_rate(
             summary[f"win_rate_{hold_days}d"] = round(df_res[f"win_{hold_days}d"].mean() * 100, 1)
             summary[f"avg_ret_{hold_days}d"] = round(df_res[f"ret_{hold_days}d"].mean() * 100, 2)
     return summary, df_logs
+
+
+def long_pullback_state(df: pd.DataFrame) -> str:
+    """Classify the last bar using only the breakout and bars that follow it."""
+    close = df["Close"]
+    high = df["High"]
+    volume = df["Volume"]
+    breakout = (close > high.shift().rolling(20).max()) & (volume >= VOLUME_SURGE_RATIO * df["Vol_MA20"])
+    pullback = (
+        (close < close.shift()) & (volume < df["Vol_MA20"])
+        & ((close / df["MA_long"] - 1).between(0, 0.08))
+    )
+    armed = watching = False
+    for pos in range(max(1, len(df) - 21), len(df)):
+        confirmed = watching and close.iloc[pos] > high.iloc[pos - 1]
+        if confirmed and pos == len(df) - 1:
+            return "正式入選"
+        if breakout.iloc[pos]:
+            armed, watching = True, False
+        elif confirmed or close.iloc[pos] < df["MA_long"].iloc[pos]:
+            armed = watching = False
+        elif armed and pullback.iloc[pos]:
+            watching = True
+    return "觀察中" if watching else ""
 
 
 def run_market_scanner(
@@ -356,11 +386,14 @@ def run_market_scanner(
             "Support_Holds": support_holds,
             "Momentum_Breakout": momentum_breakout,
             "Vol_Shrink": vol_shrink,
+            "Pullback_State": "" if is_short_strategy else long_pullback_state(
+                df if timeframe == "D" else process_timeframe_and_ma(df_slice, "D", short_ma, long_ma)
+            ),
             "Vol_Surge": vol_surge,
             "Is_New": is_new_signal,
             "Is_Emerging": is_emerging_stock(str(stock_id)),
             "週期形態": "周K" if timeframe == "W" else "日K",
-            "資料日期": df.index[-1].strftime("%Y-%m-%d"),
+            "資料日期": df_raw.index[-1].strftime("%Y-%m-%d"),
         })
 
     return pd.DataFrame(results)

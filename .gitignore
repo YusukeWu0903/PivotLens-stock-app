@@ -22,3 +22,7 @@ sandbox_test_v2.py
 
 # 更新中斷時的本地暫存檔
 market_cache_checkpoint.parquet
+market_cache.lock
+market_cache.previous/
+market_cache.stage-*/
+market_cache_checkpoint.parquet.tmp

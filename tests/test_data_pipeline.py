@@ -110,6 +110,7 @@ def test_fallback_only_fetches_lagging_stock_through_previous_session(tmp_path, 
     watchlist = tmp_path / "watchlist.txt"
     cache_dir = tmp_path / "market_cache"
     calls = []
+    monkeypatch.setattr(update_market_data, "CHECKPOINT_FILE", str(tmp_path / "checkpoint.parquet"))
     monkeypatch.setattr(update_market_data, "CACHE_DIR", str(cache_dir))
     monkeypatch.setattr(update_market_data, "FINMIND_TOKEN", "offline-placeholder")
     monkeypatch.setattr(update_market_data, "WATCHLIST_FILE", str(watchlist))
@@ -171,3 +172,26 @@ def test_request_spacing_is_applied_before_each_fetch(monkeypatch):
     update_market_data.wait_for_request_slot()
     assert waits == [3.0]
     assert update_market_data._next_request_at == 106.0
+
+@pytest.mark.parametrize("failure", ["write", "switch"])
+def test_interrupted_publish_preserves_previous_snapshot(tmp_path, monkeypatch, failure):
+    from pathlib import Path
+    cache = tmp_path / "market_cache"
+    old = pd.DataFrame({"Stock_ID": ["2330"], "Date": pd.to_datetime(["2026-10-07"]),
+                        "Close": [100.], "Tier": ["tier1_hot"]})
+    old.to_parquet(cache, partition_cols=["Tier"], index=False)
+    new = old.assign(Close=120.)
+    if failure == "write":
+        def interrupted(*args, **kwargs):
+            raise OSError("injected write failure")
+        monkeypatch.setattr(pd.DataFrame, "to_parquet", interrupted)
+    else:
+        rename = Path.rename
+        def interrupted(path, destination):
+            if path.name == "snapshot":
+                raise OSError("injected switch failure")
+            return rename(path, destination)
+        monkeypatch.setattr(Path, "rename", interrupted)
+    with pytest.raises(OSError, match="injected"):
+        update_market_data.publish_market_cache(new, cache)
+    assert pd.read_parquet(cache)["Close"].tolist() == [100.]

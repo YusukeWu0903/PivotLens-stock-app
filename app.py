@@ -76,7 +76,9 @@ def load_market_data(cache_key: str):
 
 
 # ⚡ 傳入時間戳金鑰，讓快取能精準追蹤變更
-current_mtime_key = get_market_cache_key(CACHE_DIR)
+if not os.path.isdir(CACHE_DIR) and os.path.isdir(CACHE_DIR + ".previous"):
+    CACHE_DIR += ".previous"
+current_mtime_key = CACHE_DIR + ":" + get_market_cache_key(CACHE_DIR)
 stock_dict = load_market_data(cache_key=current_mtime_key)
 
 if not stock_dict:
@@ -96,10 +98,10 @@ def get_stock_name(stock_id):
 # 掃描器包裝函式 (帶快取)
 # ==========================================
 @st.cache_data(ttl=3600)
-def run_scanner_cached(_stock_dict, strategy_name, cache_key: str):
+def run_scanner_cached(_stock_dict, strategy_name, cache_key: str, market_day):
     """只快取「基礎大掃描」的結果，當 cache_key 改變時自動重算"""
     return run_market_scanner(
-        stock_dict=_stock_dict,
+        stock_dict={sid: data for sid, data in _stock_dict.items() if data.index[-1].normalize() == market_day},
         strategy_name=strategy_name
     )
 
@@ -143,8 +145,8 @@ price_range = st.sidebar.selectbox(
 # 3. 依多空調整進場型態文案
 if not is_short:
     pattern_label = "買點型態"
-    pattern_options = ["拉回支撐 (量縮潛伏)", "強勢創高 (帶量突破)"]
-    pattern_help = "【拉回支撐】成交量低於 20 期均量，收盤價在長均線上方 0~8%。\n【強勢創高】成交量至少為 20 期均量 1.2 倍，收盤突破先前 20 期高點且收在當期較高位置。"
+    pattern_options = ["拉回支撐 (轉強確認)", "強勢創高 (帶量突破)"]
+    pattern_help = "【拉回支撐】近 20 個交易日曾帶量突破前 20 日高點，之後量縮收低且在長均線上方 0~8% 時觀察；收盤高於前日高點才正式入選。\n【強勢創高】成交量至少為 20 期均量 1.2 倍，收盤突破先前 20 期高點且收在當期較高位置。"
 else:
     pattern_label = "賣點/放空型態"
     pattern_options = ["反彈遇壓 (量縮潛伏)", "弱勢破底 (帶量下殺)"]
@@ -167,7 +169,7 @@ if stock_dict:
     st.sidebar.markdown("### 📅 資料更新狀態")
     st.sidebar.caption(
         f"• **快取最新日期**：`{latest_data_date}`\n\n"
-        f"• **到達此日期**：`{latest_stock_count}/{len(stock_dict)}` 檔\n\n"
+        f"• **僅掃描到達此日期的資料**：`{latest_stock_count}/{len(stock_dict)}` 檔\n\n"
         "• **預定更新**：17:35 起分 5 輪，至次日 01:35 啟動最後一輪；實際完成時間依排程與資料供應而定。"
     )
     if (pd.Timestamp.today().normalize() - latest_data_day.normalize()).days > 7:
@@ -182,7 +184,8 @@ with st.spinner(f"正在計算【{strategy_name}】全市場指標 (每日初次
     raw_scan_df = run_scanner_cached(
         _stock_dict=stock_dict, 
         strategy_name=strategy_name,
-        cache_key=current_mtime_key
+        cache_key=current_mtime_key,
+        market_day=latest_data_day,
     )
 
 # ⚡ 開始零延遲 Pandas 記憶體過濾
@@ -192,6 +195,18 @@ if raw_scan_df is not None and not raw_scan_df.empty:
     )
 else:
     scan_df = pd.DataFrame()
+
+if "拉回支撐" in entry_pattern:
+    watch_df = filter_scan_results(
+        raw_scan_df, entry_pattern, min_vol, price_range, exclude_emerging, watch_only=True
+    )
+    with st.expander(f"拉回觀察名單（{len(watch_df)} 檔）", expanded=not watch_df.empty):
+        if watch_df.empty:
+            st.caption("目前沒有等待轉強的標的。")
+        else:
+            watch_df["股票名稱"] = watch_df["股票代號"].map(get_stock_name)
+            st.dataframe(watch_df[["股票代號", "股票名稱", "最新收盤價", "資料日期"]], hide_index=True)
+        st.caption("觀察期間不計入勝率；首次收盤高於前日高點才以當日收盤價起算。")
 
 st.divider()
 
@@ -207,12 +222,12 @@ if scan_df is not None and not scan_df.empty:
     curr_n_days = cfg["n_days"]
     tf_unit = "周" if cfg["timeframe"] == "W" else "日"
 
-    st.subheader(f"📊 掃描結果：{strategy_name}")
+    st.subheader(f"📊 正式入選：{strategy_name}")
     st.info("💡 **雙引擎量價策略與洗盤防禦說明**："
             "" + chr(10) + chr(10) + ""
             "* **核心邏輯**：" + cfg['desc'] + ""
             "" + chr(10) + chr(10) + ""
-            "* **潛伏引擎 (拉回支撐 / 反彈遇壓)**：買在主力防守點。成交量**低於 20 期均量**，股價在長均線同側 0~8% 內。"
+            "* **潛伏引擎 (拉回支撐 / 反彈遇壓)**：多方依序確認帶量突破、量縮拉回、收盤突破前日高點；空方以量縮及距長均線 0~8% 判定。"
             "" + chr(10) + chr(10) + ""
             "* **動能引擎 (強勢創高 / 弱勢破底)**：收盤突破過往 20 期高低點，K 棒收在有利方向，且成交量**至少為 20 期均量的 1.2 倍**。"
             "" + chr(10) + chr(10) + ""
@@ -248,4 +263,4 @@ if scan_df is not None and not scan_df.empty:
         )
 
 else:
-    st.info("ℹ️ 當前條件下未找到符合策略之股票，請嘗試切換其他股價區間或買點型態。")
+    st.info("ℹ️ 當前條件下沒有正式入選標的，請嘗試切換其他股價區間或買點型態。")

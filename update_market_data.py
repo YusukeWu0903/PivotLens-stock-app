@@ -2,6 +2,10 @@ import os
 import time
 import json
 import threading
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import shutil
+from filelock import FileLock
 import pandas as pd
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -170,17 +174,46 @@ def _normalize_concat(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def publish_market_cache(frame: pd.DataFrame, cache: Path) -> None:
+    """Validate every staged partition before retiring the readable snapshot."""
+    backup = cache.with_name(cache.name + ".previous")
+    with TemporaryDirectory(dir=cache.parent, prefix=cache.name + ".stage-") as stage:
+        staged = Path(stage) / "snapshot"
+        frame.to_parquet(staged, index=False, partition_cols=["Tier"])
+        saved = pd.read_parquet(staged)
+        keys = ["Stock_ID", "Date"]
+        if not saved.sort_values(keys)[keys].reset_index(drop=True).equals(
+            frame.sort_values(keys)[keys].reset_index(drop=True)
+        ):
+            raise ValueError("新快取的股票與交易日期未完整寫入")
+        if backup.exists():
+            if not cache.exists():
+                backup.rename(cache)
+            else:
+                shutil.rmtree(backup)
+        if cache.exists():
+            cache.rename(backup)
+        try:
+            staged.rename(cache)
+        except BaseException:
+            if backup.exists():
+                backup.rename(cache)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+
+
 def read_existing_cache() -> pd.DataFrame:
     """ARCHITECTURE 1.2：同時讀取主快取與暫存檔，斷點續傳"""
     df_main = pd.DataFrame()
     df_checkpoint = pd.DataFrame()
 
-    if os.path.exists(CACHE_DIR):
-        try:
-            df_main = pd.read_parquet(CACHE_DIR)
-            df_main = _normalize_stock_id(df_main)
-        except Exception as e:
-            print(f"⚠️ 讀取主快取失敗: {e}")
+    cache = Path(CACHE_DIR)
+    backup = cache.with_name(cache.name + ".previous")
+    if not cache.exists() and backup.exists():
+        backup.rename(cache)
+    if cache.exists():
+        df_main = _normalize_stock_id(pd.read_parquet(cache))
 
     if os.path.exists(CHECKPOINT_FILE):
         try:
@@ -364,7 +397,7 @@ def update_market_cache():
                     needs_update.append(sid)
                     fetch_tasks[sid] = (stock_latest + timedelta(days=1)).strftime('%Y-%m-%d')
 
-    if not needs_update:
+    if not needs_update and not os.path.exists(CHECKPOINT_FILE):
         print(f"🎉 恭喜！全市場資料庫已經是最新的，無需更新！")
         return
 
@@ -451,7 +484,9 @@ def update_market_cache():
                         temp_final = pd.concat([existing_df, temp_df], ignore_index=True) if not existing_df.empty else temp_df
                         temp_final = _normalize_concat(temp_final)
                         temp_final = temp_final.drop_duplicates(subset=['Stock_ID', 'Date'], keep='last').sort_values(['Stock_ID', 'Date'])
-                        temp_final.to_parquet(CHECKPOINT_FILE, index=False)
+                        temp_checkpoint = Path(CHECKPOINT_FILE + ".tmp")
+                        temp_final.to_parquet(temp_checkpoint, index=False)
+                        temp_checkpoint.replace(CHECKPOINT_FILE)
 
                 if completed % 50 == 0 or completed == len(target_stocks):
                     print(f"⏳ 進度: {completed}/{len(target_stocks)}")
@@ -486,56 +521,38 @@ def update_market_cache():
         final_df = final_df.drop_duplicates(subset=['Stock_ID', 'Date'], keep='last').sort_values(['Stock_ID', 'Date'])
         final_df = _normalize_stock_id(final_df)
 
-        # ==========================================
-        # 🚀 關鍵 (ARCHITECTURE 1.1)：為每筆資料加上 Tier 分層標籤
-        # ==========================================
-
-        # 1. 計算當前資料庫中「所有股票」的近 20 日平均成交量
-        latest_vol_rank = final_df.groupby("Stock_ID")["Volume"].apply(lambda x: x.tail(20).mean()).to_dict()
-
-        # 2. 🏆 VIP 霸王條款：確保大盤指數永遠排第一、第二
-        for idx in MARKET_INDICES:
-            latest_vol_rank[idx] = float('inf')
-
-        # 3. 將所有股票依照均量由大到小排序
-        all_sids = list(latest_vol_rank.keys())
-        all_sids.sort(key=lambda sid: latest_vol_rank.get(sid, 0), reverse=True)
-
-        # 4. 依照絕對排名分配 Tier (1~552: tier1_hot | 553~1102: tier2_warm | 其餘: tier3_cold)
-        tier_map = {sid: get_tier(rank + 1) for rank, sid in enumerate(all_sids)}
-
-        # 5. 無視舊有 Tier，強制將重新計算的精準 Tier 覆寫上去
-        final_df['Tier'] = final_df['Stock_ID'].map(tier_map).fillna('tier3_cold').astype(str)
-
-        # ARCHITECTURE 1.1：寫入前先清空舊分區目錄，防止 Parquet 碎片檔案無限增生與 Git 空間膨脹
-        if os.path.exists(CACHE_DIR):
-            import shutil
-            shutil.rmtree(CACHE_DIR)
-            print(f"🧹 已清空舊快取目錄，準備寫入新分區檔案...")
-
-        # 分區寫入：partition_cols=['Tier'] 會自動建立 tier1_hot/、tier2_warm/、tier3_cold/ 子目錄
-        final_df.to_parquet(CACHE_DIR, index=False, partition_cols=['Tier'])
-
-        updated_total = len(final_df['Stock_ID'].unique())
-        new_latest_date = final_df['Date'].max().strftime('%Y-%m-%d')
-
-        # 統計各 Tier 筆數
-        tier_stock_counts = final_df.groupby('Tier')['Stock_ID'].nunique().to_dict()
-        print(f"✅ 本批次 {len(target_stocks)} 檔存檔成功！全台股覆蓋率: {updated_total}/{len(all_stocks)} | 最新日期: {new_latest_date}")
-        print(f"   📦 各層股票數: {tier_stock_counts}")
-
-        # 🔔 完美提醒！
-        if len(needs_update) > MAX_STOCKS_PER_RUN:
-            print(f"⏳ 本次 {MAX_STOCKS_PER_RUN} 檔已完美收工！為避免超過 API 每小時限制，請【休息 1 小時】後再執行下一批！")
+    elif os.path.exists(CHECKPOINT_FILE) and not existing_df.empty:
+        final_df = existing_df.sort_values(["Stock_ID", "Date"]).copy()
     else:
-        print("ℹ️ 本次未取得新數據（可能是今日盤後數據尚未公佈）。")
+        print("本次未取得新行情。")
+        return
+
+    # ==========================================
+    # 🚀 關鍵 (ARCHITECTURE 1.1)：為每筆資料加上 Tier 分層標籤
+    # ==========================================
+
+    # 1. 計算當前資料庫中「所有股票」的近 20 日平均成交量
+    latest_vol_rank = final_df.groupby("Stock_ID")["Volume"].apply(lambda x: x.tail(20).mean()).to_dict()
+
+    # 2. 🏆 VIP 霸王條款：確保大盤指數永遠排第一、第二
+    for idx in MARKET_INDICES:
+        latest_vol_rank[idx] = float('inf')
+
+    # 3. 將所有股票依照均量由大到小排序
+    all_sids = list(latest_vol_rank.keys())
+    all_sids.sort(key=lambda sid: latest_vol_rank.get(sid, 0), reverse=True)
+
+    # 4. 依照絕對排名分配 Tier (1~552: tier1_hot | 553~1102: tier2_warm | 其餘: tier3_cold)
+    tier_map = {sid: get_tier(rank + 1) for rank, sid in enumerate(all_sids)}
+
+    # 5. 無視舊有 Tier，強制將重新計算的精準 Tier 覆寫上去
+    final_df['Tier'] = final_df['Stock_ID'].map(tier_map).fillna('tier3_cold').astype(str)
+
+    publish_market_cache(final_df, Path(CACHE_DIR))
+    Path(CHECKPOINT_FILE).unlink(missing_ok=True)
+    print(f"已保存 {final_df['Stock_ID'].nunique()} 檔行情，最新日期 {final_df['Date'].max():%Y-%m-%d}")
 
 
 if __name__ == "__main__":
-    try:
+    with FileLock(CACHE_DIR + ".lock", timeout=0):
         update_market_cache()
-    finally:
-        # ARCHITECTURE 1.2：程式結束時的最後防線，無論成功/失敗/無新資料，確保幽靈暫存檔徹底清除
-        if os.path.exists(CHECKPOINT_FILE):
-            os.remove(CHECKPOINT_FILE)
-            print("🧹 程式結束，已確保中斷暫存檔被徹底清除。")

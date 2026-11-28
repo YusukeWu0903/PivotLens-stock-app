@@ -45,7 +45,7 @@ def test_volume_rules_and_opposite_directions(direction, strategy, retreat, mome
         scan = run_market_scanner({"2330": df}, strategy)
         assert len(scan) == 1
         kwargs = {"min_volume_sheets": 0, "price_range": "高價股(100元以上)" if direction > 0 else "低價股(100元以下)", "exclude_emerging": True}
-        assert (not filter_scan_results(scan, retreat, **kwargs).empty) == retreat_expected
+        assert (not filter_scan_results(scan, retreat, **kwargs).empty) == (retreat_expected and direction < 0)
         assert (not filter_scan_results(scan, momentum, **kwargs).empty) == momentum_expected
 
 
@@ -58,6 +58,8 @@ def test_volume_rules_and_opposite_directions(direction, strategy, retreat, mome
 )
 def test_historical_win_rate_replays_selected_filters(direction, strategy, retreat):
     df = make_trend(direction, future_bars=10)
+    if direction > 0:
+        df = confirmed_history()
     price_range = "高價股(100元以上)" if direction > 0 else "低價股(100元以下)"
     args = (df, "2330", strategy, retreat, 0, price_range, True, I18N["ZH"])
     summary, logs = calculate_screen_win_rate(*args)
@@ -73,7 +75,7 @@ def test_historical_win_rate_replays_selected_filters(direction, strategy, retre
 
 
 def test_weekly_screen_uses_weekly_volume_and_cross():
-    weekly_close = [100.0] * 62 + [101.0, 102.0, 103.0]
+    weekly_close = [100.0] * 62 + [99.0, 98.0, 97.0]
     dates = pd.bdate_range("2024-01-01", periods=len(weekly_close) * 5)
     closes = pd.Series([price for price in weekly_close for _ in range(5)], index=dates)
     volumes = [1_000_000] * (62 * 5) + [800_000] * (3 * 5)
@@ -81,16 +83,16 @@ def test_weekly_screen_uses_weekly_volume_and_cross():
         "Open": closes, "High": closes + 0.1, "Low": closes - 0.9,
         "Close": closes, "Volume": volumes,
     }, index=dates)
-    scan = run_market_scanner({"2330": df}, "長多 (周K 13MA + 52MA)")
+    scan = run_market_scanner({"2330": df}, "長空 (周K 13MA + 52MA)")
     assert len(scan) == 1
     filtered = filter_scan_results(
-        scan, "拉回支撐 (量縮潛伏)", 0, "高價股(100元以上)", True
+        scan, "反彈遇壓 (量縮潛伏)", 0, "低價股(100元以下)", True
     )
     assert len(filtered) == 1
 
 
 def test_weekly_historical_returns_use_weeks():
-    weekly_close = [100.0] * 62 + [101.0, 102.0, 103.0] + [103.0] * 6
+    weekly_close = [100.0] * 62 + [99.0, 98.0, 97.0] + [97.0] * 6
     dates = pd.bdate_range("2024-01-01", periods=len(weekly_close) * 5)
     closes = pd.Series([price for price in weekly_close for _ in range(5)], index=dates)
     volumes = [1_000_000] * (62 * 5) + [800_000] * (3 * 5) + [1_000_000] * (6 * 5)
@@ -99,8 +101,35 @@ def test_weekly_historical_returns_use_weeks():
         "Close": closes, "Volume": volumes,
     }, index=dates)
     summary, logs = calculate_screen_win_rate(
-        df, "2330", "長多 (周K 13MA + 52MA)", "拉回支撐 (量縮潛伏)",
-        0, "高價股(100元以上)", True, I18N["ZH"],
+        df, "2330", "長空 (周K 13MA + 52MA)", "反彈遇壓 (量縮潛伏)",
+        0, "低價股(100元以下)", True, I18N["ZH"],
     )
     assert summary is not None and summary["samples_5d"] >= 1
     assert "5週後結算日" in logs.columns
+
+def confirmed_history():
+    prices = [100.] * 85 + [105., 103., 104., 106.] + [108.] * 22
+    df = pd.DataFrame({"Close": prices}, index=pd.bdate_range("2025-01-01", periods=len(prices), name="Date"))
+    df["Open"] = df["Close"]
+    df["High"] = df["Close"] + 1
+    df["Low"] = df["Close"] - 1
+    df["Volume"] = [2_000_000] * 85 + [4_000_000, 900_000, 2_000_000, 2_000_000] + [2_000_000] * 22
+    return df
+
+
+def test_confirmed_day_is_the_only_pullback_entry():
+    df = confirmed_history()
+    strategy = "短多 (日K 5MA + 20MA)"
+    args = ("拉回支撐 (轉強確認)", 1000, "高價股(100元以上)", True)
+    for i, formal, watch in [(85, False, False), (86, False, True), (87, False, True),
+                             (88, True, False), (89, False, False)]:
+        snap = run_market_scanner({"2330": df.iloc[:i+1]}, strategy)
+        assert (not filter_scan_results(snap, *args).empty) == formal
+        assert (not filter_scan_results(snap, *args, watch_only=True).empty) == watch
+    stats, logs = calculate_screen_win_rate(df, "2330", strategy, *args, I18N["ZH"])
+    assert logs[I18N["ZH"]["log_entry_date"]].tolist() == [df.index[88].strftime("%Y-%m-%d")]
+    assert logs[I18N["ZH"]["log_entry_price"]].tolist() == [106.]
+    for n in (5, 10, 20):
+        assert stats[f"samples_{n}d"] == 1
+        assert stats[f"avg_ret_{n}d"] == round((108 / 106 - 1) * 100, 2)
+        assert logs[f"{n}日後結算日"].iloc[0] == df.index[88+n].strftime("%Y-%m-%d")
