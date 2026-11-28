@@ -20,7 +20,7 @@ concurrency:
 jobs:
   visit-app:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -59,7 +59,7 @@ jobs:
                   heading = page.get_by_role("heading", name=app_title).first
                   wake_button = page.get_by_text(wake_text).first
                   woke_app = False
-                  deadline = time.monotonic() + 180
+                  deadline = time.monotonic() + 300
 
                   while time.monotonic() < deadline:
                       if heading.is_visible():
@@ -71,8 +71,10 @@ jobs:
                           print("Clicked the Streamlit wake button")
                       page.wait_for_timeout(3000)
                   else:
+                      print(f"Page URL: {page.url}")
+                      print(f"Visible page text: {page.locator('body').inner_text()[:1500]}")
                       raise RuntimeError(
-                          f"App heading did not appear within 3 minutes; page title: {page.title()}"
+                          f"App heading did not appear within 5 minutes; page title: {page.title()}"
                       )
               finally:
                   browser.close()
