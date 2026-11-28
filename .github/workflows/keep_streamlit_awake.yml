@@ -1,6 +1,10 @@
 name: Keep Streamlit App Awake
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/keep_streamlit_awake.yml'
   schedule:
     # Every six hours, away from the top of the hour to reduce schedule delays.
     - cron: '53 0,6,12,18 * * *'
